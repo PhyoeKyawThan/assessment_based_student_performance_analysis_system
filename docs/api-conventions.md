@@ -29,10 +29,11 @@ A page served from another origin can only reach the API if `django-cors-headers
 | Setting | Value |
 | --- | --- |
 | `CORS_ALLOWED_ORIGINS` | space-separated from the environment, defaulting to the Expo web dev ports `http://localhost:8081`, `:19000`, `:19006` |
+| `CORS_ALLOWED_ORIGIN_REGEXES` | only when `DEBUG=True`: any host on those ports, because `expo start --host lan` is reached through the machine's LAN address |
 | `CORS_ALLOW_HEADERS` | the defaults plus `client-type`, which selects the table above |
 | `CORS_ALLOW_CREDENTIALS` | `True`, so the cookie path works from an allowed origin |
 
-Without `client-type` in `CORS_ALLOW_HEADERS` the preflight succeeds but the browser still blocks the real request, which surfaces in the client as `TypeError: NetworkError`.
+A rejected preflight shows up in the client as `TypeError: NetworkError when attempting to fetch resource.`, the same symptom as a missing `client-type` in `CORS_ALLOW_HEADERS`, so check the response for an `Access-Control-Allow-Origin` header before debugging the client. Deployments must not rely on the `DEBUG` regexes: set `CORS_ALLOWED_ORIGINS` to the exact origins instead, since credentialed requests plus a host wildcard would let any local page call the API.
 
 ## Authentication
 
@@ -125,3 +126,15 @@ New routes use one shape. SimpleJWT login and refresh keep their own `detail` st
 - `PUT` is not used.
 - Deletes that would orphan marks, or break a published scheme, return `409`.
 - Bulk writes are atomic. If one row fails, nothing in that request is saved.
+
+## Push notifications
+
+Two events reach a device: a mark written for a student, and an assessment that moves to `OPEN`. The
+message is sent after the API has committed its write, in the same request, to `https://exp.host/--/api/v2/push/send`.
+
+`EXPO_ACCESS_TOKEN` in `.env` is optional. Without it every send is logged and skipped, so a local
+run never reaches Expo. `manage.py test` blanks the token before the suite starts, and the push
+tests patch the transport, so no test can deliver for real.
+
+A token the service reports as `DeviceNotRegistered` is cleared, which is what happens after a
+device is wiped or the app is uninstalled. The client registers again on its next sign-in.

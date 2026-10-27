@@ -12,6 +12,7 @@ from core.views import RepresentationMixin
 from marking import services
 from marking.models import AssessmentResult
 from teaching.models import Assessment, AssessmentDistribution, LecturePlan
+from teaching.notifications import notify_assessment_opened
 from teaching.permissions import IsPlanWriter, is_admin
 from teaching.serializers import (
     AssessmentDistributionSerializer,
@@ -171,6 +172,7 @@ class AssessmentViewSet(RepresentationMixin, viewsets.ModelViewSet):
             raise ConflictError(f'Cannot open an assessment that is {assessment.status}.')
         assessment.status = Assessment.Status.OPEN
         assessment.save(update_fields=['status'])
+        notify_assessment_opened(assessment)
         return Response(self.representation_serializer_class(assessment).data)
 
     @action(detail=True, methods=['post'])

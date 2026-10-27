@@ -11,6 +11,9 @@ class User(AbstractUser):
     role = models.CharField(max_length=50, choices=Role.choices, default=Role.STUDENT)
     email = models.EmailField(unique=True)
     full_name = models.CharField(max_length=150)
+    # One Expo push token per account: the client overwrites it on every sign-in, so a
+    # reinstalled app or a new device simply replaces the value.
+    push_token = models.CharField(max_length=255, blank=True, default='')
 
     first_name = None
     last_name = None

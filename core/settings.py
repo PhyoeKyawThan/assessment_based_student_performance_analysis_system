@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'catalog',
     'teaching',
     'marking',
+    'dashboard',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -95,6 +96,12 @@ CORS_ALLOWED_ORIGINS = os.getenv(
 CORS_ALLOW_CREDENTIALS = True
 # 'client-type' selects the cookie vs JSON token path, so browsers must be allowed to send it.
 CORS_ALLOW_HEADERS = list(default_headers) + ['client-type']
+# Phone and tablet browsers reach `expo start --web` over the machine's LAN address, so during
+# development the origin host is unknown ahead of time and only the Expo dev port is fixed.
+# Credentialed requests plus a host wildcard are too permissive for production, so this stays
+# behind DEBUG and real deployments must list their origins in CORS_ALLOWED_ORIGINS instead.
+if DEBUG:
+    CORS_ALLOWED_ORIGIN_REGEXES = [r'^https?://[^/]+:(8081|19000|19006)$']
 
 ROOT_URLCONF = 'core.urls'
 
@@ -178,3 +185,16 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+
+# Push notifications
+# https://docs.expo.dev/push-notifications/sending-notifications/
+
+# An Expo access token (https://expo.dev/<account>/settings) is optional: without it
+# core/notifications.py logs and skips, so local runs never reach the network.
+EXPO_ACCESS_TOKEN = os.getenv('EXPO_ACCESS_TOKEN', '')
+EXPO_PUSH_URL = os.getenv('EXPO_PUSH_URL', 'https://exp.host/--/api/v2/push/send')
+EXPO_PUSH_TIMEOUT = float(os.getenv('EXPO_PUSH_TIMEOUT', '5'))
+
+# Tests read the same .env as the dev server, so the runner blanks the token before the suite runs.
+TEST_RUNNER = 'core.test_runner.PushFreeTestRunner'

@@ -2,7 +2,7 @@ from django.test import TestCase
 
 from catalog.models import Enrollment
 from catalog.tests import CatalogFixtureMixin
-from core.testing import api_client, make_user
+from core.testing import api_client, make_user, mock_push_transport
 from teaching.models import Assessment, AssessmentDistribution, LecturePlan
 from users.models import User
 
@@ -702,3 +702,66 @@ class AssessmentTests(TeachingFixtureMixin, TestCase):
         self.assertEqual(
             api_client(self.student).get(f'/api/assessments/{assessment.pk}/').status_code, 200
         )
+
+
+class AssessmentOpenPushTests(TeachingFixtureMixin, TestCase):
+    def setUp(self):
+        self.teacher = make_user(role=User.Role.TEACHER)
+        self.admin = make_user(role=User.Role.ADMIN)
+        self.client = api_client(self.admin)
+        self.plan = self.make_plan(lecturer=self.teacher, status=LecturePlan.Status.PUBLISHED)
+        self.distribution = self.make_distribution(plan=self.plan)
+        self.assessment = self.make_assessment(distribution=self.distribution)
+
+    def enroll(self, index, status=Enrollment.Status.ENROLLED, registered=True):
+        student = make_user(role=User.Role.STUDENT, full_name=f'Student {index}')
+        if registered:
+            student.push_token = f'ExponentPushToken[student-{index}]'
+            student.save(update_fields=['push_token'])
+        enrollment = Enrollment.objects.create(
+            student=student, module=self.plan.module, status=status
+        )
+        return enrollment, student
+
+    def post_open(self):
+        return self.client.post(f'/api/assessments/{self.assessment.pk}/open/', {}, format='json')
+
+    def test_opening_an_assessment_tells_the_enrolled_students(self):
+        _enrollment, student = self.enroll(1)
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.post_open()
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(
+            batches[0][0],
+            {
+                'to': student.push_token,
+                'title': 'Assessment is open',
+                'body': f'{self.plan.module.module_code} · {self.assessment.title} is now open for marks.',
+                'data': {'type': 'assessment', 'assessment_id': str(self.assessment.pk)},
+            },
+        )
+
+    def test_only_registered_and_active_students_are_reached(self):
+        _kept, kept_student = self.enroll(1)
+        self.enroll(2, registered=False)
+        self.enroll(3, status=Enrollment.Status.DROPPED)
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.post_open()
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual([message['to'] for message in batches[0]], [kept_student.push_token])
+
+    def test_a_refused_open_sends_nothing(self):
+        self.enroll(1)
+        self.assessment.status = Assessment.Status.GRADED
+        self.assessment.save(update_fields=['status'])
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.post_open()
+
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertEqual(batches, [])

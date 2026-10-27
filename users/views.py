@@ -1,5 +1,5 @@
 from django.db.models import ProtectedError, Q
-from rest_framework import viewsets
+from rest_framework import status, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -20,6 +20,7 @@ from users.models import User
 from users.permissions import IsAdminRole
 from users.serializers import (
     MeUpdateSerializer,
+    PushTokenSerializer,
     UserAdminUpdateSerializer,
     UserCreateSerializer,
     UserRepresentationSerializer,
@@ -90,6 +91,22 @@ class MeView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(UserRepresentationSerializer(request.user).data)
+
+
+class MePushTokenView(APIView):
+    """POST registers this device's Expo push token, DELETE clears it."""
+
+    def post(self, request):
+        serializer = PushTokenSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        request.user.push_token = serializer.validated_data['push_token']
+        request.user.save(update_fields=['push_token'])
+        return Response({'has_push_token': True})
+
+    def delete(self, request):
+        request.user.push_token = ''
+        request.user.save(update_fields=['push_token'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class UserViewSet(RepresentationMixin, viewsets.ModelViewSet):

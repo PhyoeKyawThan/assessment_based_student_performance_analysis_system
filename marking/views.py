@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from core.filters import uuid_param
 from core.views import RepresentationMixin
 from marking.models import AssessmentResult
+from marking.notifications import notify_marks_recorded
 from marking.permissions import IsResultWriter
 from marking.serializers import (
     AssessmentResultBulkSerializer,
@@ -49,12 +50,19 @@ class AssessmentResultViewSet(RepresentationMixin, viewsets.ModelViewSet):
                 queryset = queryset.filter(**{lookup: uuid_param(param, raw)})
         return queryset
 
+    def perform_create(self, serializer):
+        notify_marks_recorded([serializer.save()])
+
+    def perform_update(self, serializer):
+        notify_marks_recorded([serializer.save()])
+
     @action(detail=False, methods=['post'])
     def bulk(self, request):
         serializer = AssessmentResultBulkSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         with atomic():
             results = serializer.save()
+        notify_marks_recorded(results)
         return Response([
             self.representation_serializer_class(result).data for result in results
         ])

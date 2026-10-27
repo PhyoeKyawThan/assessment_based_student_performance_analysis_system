@@ -1,20 +1,44 @@
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
+import re
+
 from rest_framework import serializers
 
 from users.models import User
+
+PUSH_TOKEN_PATTERN = re.compile(r'^Expo(nent)?PushToken\[[^\]\s]{1,128}\]$')
 
 
 class UserRepresentationSerializer(serializers.ModelSerializer):
     """Read shape for /api/me/ and /api/users/. The password is never present."""
 
+    has_push_token = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = (
             'id', 'username', 'email', 'full_name', 'role',
-            'is_active', 'is_staff', 'last_login', 'date_joined',
+            'is_active', 'is_staff', 'last_login', 'date_joined', 'has_push_token',
         )
         read_only_fields = fields
+
+    def get_has_push_token(self, user) -> bool:
+        # The token itself is a device credential, so only its presence is exposed.
+        return bool(user.push_token)
+
+
+class PushTokenSerializer(serializers.Serializer):
+    """Body of POST /api/me/push-token/."""
+
+    push_token = serializers.CharField(max_length=255)
+
+    def validate_push_token(self, value):
+        value = value.strip()
+        if not PUSH_TOKEN_PATTERN.match(value):
+            raise serializers.ValidationError(
+                'Expected an Expo push token, for example ExponentPushToken[...].'
+            )
+        return value
 
 
 class MeUpdateSerializer(serializers.ModelSerializer):

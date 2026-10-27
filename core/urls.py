@@ -28,4 +28,5 @@ urlpatterns = [
     path('api/', include('catalog.urls')),
     path('api/', include('teaching.urls')),
     path('api/', include('marking.urls')),
+    path('api/', include('dashboard.urls')),
 ]

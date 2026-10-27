@@ -225,6 +225,7 @@ class MeTests(TestCase):
             {
                 'id', 'username', 'email', 'full_name', 'role',
                 'is_active', 'is_staff', 'last_login', 'date_joined',
+                'has_push_token',
             },
         )
         self.assertEqual(data['role'], 'STUDENT')
@@ -464,3 +465,61 @@ class UserAdminTests(TestCase):
 
         self.assertEqual(response.status_code, 204)
         self.assertFalse(User.objects.filter(pk=target.pk).exists())
+
+
+class PushTokenTests(TestCase):
+    TOKEN = 'ExponentPushToken[9y-Tn8mQxQqLkV3pB7dRfe]'
+
+    def test_post_registers_the_device_token(self):
+        user = make_user()
+
+        response = api_client(user).post(
+            '/api/me/push-token/', {'push_token': self.TOKEN}, format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data, {'has_push_token': True})
+        user.refresh_from_db()
+        self.assertEqual(user.push_token, self.TOKEN)
+
+    def test_a_second_device_replaces_the_first(self):
+        user = make_user(push_token=self.TOKEN)
+        other = 'ExpoPushToken[aaaaaaaaaa]'
+
+        api_client(user).post('/api/me/push-token/', {'push_token': other}, format='json')
+
+        user.refresh_from_db()
+        self.assertEqual(user.push_token, other)
+
+    def test_only_expo_token_shapes_are_accepted(self):
+        for value in ('', 'https://onesignal.com/api/v1/notifications', 'ExponentPushToken[]'):
+            with self.subTest(value=value):
+                response = api_client(make_user()).post(
+                    '/api/me/push-token/', {'push_token': value}, format='json'
+                )
+                self.assertEqual(response.status_code, 400, response.data)
+                self.assertEqual(response.data['code'], 'validation_error')
+                self.assertIn('push_token', response.data['fields'])
+
+    def test_delete_clears_the_token(self):
+        user = make_user(push_token=self.TOKEN)
+
+        response = api_client(user).delete('/api/me/push-token/')
+
+        self.assertEqual(response.status_code, 204)
+        user.refresh_from_db()
+        self.assertEqual(user.push_token, '')
+
+    def test_me_reports_presence_but_never_the_token(self):
+        user = make_user(push_token=self.TOKEN)
+
+        data = api_client(user).get('/api/me/').data
+
+        self.assertTrue(data['has_push_token'])
+        self.assertNotIn('push_token', data)
+
+    def test_anonymous_cannot_register(self):
+        response = api_client().post('/api/me/push-token/', {'push_token': self.TOKEN}, format='json')
+
+        self.assertEqual(response.status_code, 401)
+

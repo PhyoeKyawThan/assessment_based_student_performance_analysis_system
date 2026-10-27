@@ -1,7 +1,7 @@
 from django.test import TestCase
 
 from catalog.models import Enrollment
-from core.testing import api_client, make_user
+from core.testing import api_client, make_user, mock_push_transport
 from marking.models import AssessmentResult
 from teaching.models import Assessment, AssessmentDistribution, LecturePlan
 from teaching.tests import TeachingFixtureMixin
@@ -509,3 +509,112 @@ class GradingCompletionTests(MarkingTestCase):
 
         self.assertEqual(response.status_code, 409, response.data)
         self.assertTrue(User.objects.filter(pk=self.admin.pk).exists())
+
+
+class MarkPushTests(MarkingTestCase):
+    def setUp(self):
+        super().setUp()
+        self.open(self.quiz_one)
+
+    def give(self, user, index):
+        user.push_token = f'ExponentPushToken[student-{index}]'
+        user.save(update_fields=['push_token'])
+        return user.push_token
+
+    def test_a_recorded_mark_notifies_that_student(self):
+        token = self.give(self.student, 1)
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.teacher_client.post(
+                '/api/assessment-results/', self.payload(self.quiz_one, self.enrollment), format='json'
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(len(batches), 1)
+        message = batches[0][0]
+        self.assertEqual(message['to'], token)
+        self.assertEqual(message['title'], 'Your mark is ready')
+        self.assertIn(self.quiz_one.title, message['body'])
+        self.assertIn('8.00', message['body'])
+        self.assertEqual(message['data'], {'type': 'mark', 'assessment_id': str(self.quiz_one.pk)})
+
+    def test_a_correction_notifies_again(self):
+        self.give(self.student, 1)
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            created = self.client.post(
+                '/api/assessment-results/', self.payload(self.quiz_one, self.enrollment), format='json'
+            ).data
+            batches.clear()
+
+            response = self.teacher_client.patch(
+                f"/api/assessment-results/{created['id']}/", {'marks_obtained': '9.50'}, format='json'
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual([message['title'] for message in batches[0]], ['Your mark is ready'])
+
+    def test_a_bulk_run_is_one_request_holding_one_message_per_student(self):
+        first = self.give(self.student, 1)
+        second = self.give(self.second_student, 2)
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.teacher_client.post(
+                '/api/assessment-results/bulk/',
+                self.bulk_payload(
+                    self.quiz_one, [(self.enrollment, '8.00'), (self.second_enrollment, '5.00')]
+                ),
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual([message['to'] for message in batches[0]], [first, second])
+        self.assertEqual(
+            [message['data'] for message in batches[0]],
+            [{'type': 'mark', 'assessment_id': str(self.quiz_one.pk)}] * 2,
+        )
+
+    def test_a_student_without_a_token_is_left_out_of_the_bulk(self):
+        second = self.give(self.second_student, 2)
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.teacher_client.post(
+                '/api/assessment-results/bulk/',
+                self.bulk_payload(
+                    self.quiz_one, [(self.enrollment, '8.00'), (self.second_enrollment, '5.00')]
+                ),
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual([message['to'] for message in batches[0]], [second])
+
+    def test_an_unregistered_student_gets_nothing(self):
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.teacher_client.post(
+                '/api/assessment-results/', self.payload(self.quiz_one, self.enrollment), format='json'
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(batches, [])
+
+    def test_a_failed_bulk_rolls_back_and_notifies_nobody(self):
+        self.give(self.student, 1)
+        unknown = '00000000-0000-4000-8000-000000000000'
+
+        with self.settings(EXPO_ACCESS_TOKEN='expo-server-token'), mock_push_transport() as batches:
+            response = self.teacher_client.post(
+                '/api/assessment-results/bulk/',
+                {
+                    'assessment_id': str(self.quiz_one.pk),
+                    'results': [
+                        {'enrollment_id': str(self.enrollment.pk), 'marks_obtained': '8.00'},
+                        {'enrollment_id': unknown, 'marks_obtained': '7.00'},
+                    ],
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(batches, [])

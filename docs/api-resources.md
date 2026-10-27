@@ -84,11 +84,22 @@ Any authenticated user.
   "is_active": true,
   "is_staff": false,
   "last_login": "2026-10-26T01:00:00Z",
-  "date_joined": "2026-10-01T00:00:00Z"
+  "date_joined": "2026-10-01T00:00:00Z",
+  "has_push_token": true
 }
 ```
 
 Password is never returned.
+
+### `POST /api/me/push-token/`
+
+Register this device for push notifications. Body `{"push_token": "ExponentPushToken[...]"}`; anything that is not an Expo token shape returns `400`. The response is `{"has_push_token": true}`.
+
+One token per account: a second device replaces the first, which is what a reinstall or a new phone needs. The token is a device credential, so only `has_push_token` is ever readable back.
+
+### `DELETE /api/me/push-token/`
+
+Forget this account's device. `204`. The mobile app calls this on sign-out.
 
 ### `PATCH /api/me/`
 
@@ -105,6 +116,73 @@ Teacher only. Same row shape as [lecture plans](#lecture-plans), limited to `lec
 ### `GET /api/me/performance/`
 
 Student only. Query `academic_id` optional. Same payload as the student analysis route for the caller. See [api-analysis.md](api-analysis.md).
+
+## Dashboard
+
+One non-paginated read that fills a whole role home, so the client does not fan out across the list endpoints to count rows.
+
+### `GET /api/dashboard/`
+
+Any authenticated user. The body depends on `role` of the caller; a superuser always gets the admin shape.
+
+Three parts are shared by every role:
+
+| Field | Shape |
+| --- | --- |
+| `stats[]` | `{key, label, value, tone}` tiles in render order. `value` is always a string, so a count and an academic year share one field. `tone` is `primary`, `accent`, `success`, `warning`, `danger` or `neutral`; a client falls back to `neutral` for anything else. |
+| `donut` | `{title, total, slices: [{key, label, value}]}`. Every choice of the enum is present, including zero counts. |
+| `bars` | `{title, series: [{key, label, tone}], groups: [{label, values}]}`. `values[key]` is a number for admin and teacher, a decimal string for the student marks chart. |
+
+Then per role:
+
+| Role | Extra fields |
+| --- | --- |
+| `ADMIN` | `recent_modules` (current academic year), `recent_enrollments` |
+| `TEACHER` | `upcoming_assessments`, `recent_marks` (own grading only) |
+| `STUDENT` | `upcoming_assessments` (published plans the caller is enrolled in), `recent_marks` (own results) |
+
+```json
+{
+  "role": "TEACHER",
+  "stats": [
+    {"key": "modules", "label": "My modules", "value": "1", "tone": "primary"},
+    {"key": "draft_plans", "label": "Draft plans", "value": "0", "tone": "warning"},
+    {"key": "published_plans", "label": "Published plans", "value": "1", "tone": "success"},
+    {"key": "open_assessments", "label": "Open assessments", "value": "1", "tone": "accent"}
+  ],
+  "donut": {
+    "title": "Lecture plan status",
+    "total": 1,
+    "slices": [
+      {"key": "DRAFT", "label": "Draft", "value": 0},
+      {"key": "PUBLISHED", "label": "Published", "value": 1}
+    ]
+  },
+  "bars": {
+    "title": "Assessments by status",
+    "series": [{"key": "count", "label": "Assessments", "tone": "primary"}],
+    "groups": [{"label": "Scheduled", "values": {"count": 0}}]
+  },
+  "upcoming_assessments": [
+    {
+      "id": "3a5e...-uuid", "title": "Quiz 1", "type": "QUIZ", "type_label": "Quiz",
+      "sequence_no": 1, "max_mark": "10.00", "assessment_date": "2026-10-28",
+      "status": "OPEN", "status_label": "Open",
+      "module_code": "CS101", "module_name": "Programming Fundamentals"
+    }
+  ],
+  "recent_marks": [
+    {
+      "id": "9c2b...-uuid", "marks_obtained": "8.00", "max_mark": "10.00",
+      "percentage": "80.0", "remark": "", "graded_at": "2026-10-26T01:20:00Z",
+      "assessment_title": "Quiz 2", "module_code": "CS101",
+      "module_name": "Programming Fundamentals", "student": "Aye Aye"
+    }
+  ]
+}
+```
+
+Scope rules: a teacher's totals never include another lecturer's plans, and a student only sees assessments under a `PUBLISHED` plan for a module they are `ENROLLED` in. Marks come from `marking.services.percentage_of`, so a zero `max_mark` yields `null` rather than a division error.
 
 ## Users
 
@@ -410,6 +488,8 @@ While the plan is `PUBLISHED`:
 
 `SCHEDULED` to `OPEN`. The parent plan must be `PUBLISHED`. Marks are accepted from this state onward.
 
+Every `ENROLLED` or `COMPLETED` student of the module who registered a push token gets one notification.
+
 ### `POST /api/assessments/{id}/close/`
 
 `OPEN` to `CLOSED`. Marks remain editable.
@@ -516,6 +596,7 @@ Rules:
 - Unique `(assessment_id, enrollment_id)`. A second `POST` returns `409`. Use `PATCH`.
 - Server sets `graded_by` to the caller and `graded_at` to the current time. The caller must be a `TEACHER` or an admin. Admin graders are stored, and the role check allows admin.
 - After a successful write or delete, recompute `module_performance` for that enrollment.
+- A `POST`, `PATCH`, or `bulk` write notifies the marked students who registered a push token.
 
 Response adds `id`, `graded_by` (`id`, `full_name`), `graded_at`, `max_mark`, and `percentage` for this item only (`marks_obtained / max_mark * 100`, one decimal string). That item percentage is not the module weight.
 

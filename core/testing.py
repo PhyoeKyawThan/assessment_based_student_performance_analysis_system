@@ -1,5 +1,8 @@
 """Helpers shared by the test suites: user factory and an authenticated client."""
 
+import json
+from contextlib import contextmanager
+from unittest.mock import patch
 from uuid import uuid4
 
 from rest_framework.test import APIClient
@@ -35,3 +38,36 @@ def api_client(user=None, password=PASSWORD):
         assert response.status_code == 200, response.data
         client.credentials(HTTP_AUTHORIZATION=f'Bearer {response.data["access"]}')
     return client
+
+
+class _FakeExpoResponse:
+    def __init__(self, tickets):
+        self._body = json.dumps({'data': tickets}).encode('utf-8')
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+@contextmanager
+def mock_push_transport(ticket_factory=None):
+    """Stand in for exp.host so a push test never opens a socket.
+
+    Yields the list of message batches the service tried to deliver. `ticket_factory` turns one
+    message into the ticket Expo reports back for it; the default accepts everything.
+    """
+    batches = []
+
+    def fake_urlopen(request, timeout=None):
+        messages = json.loads(request.data.decode('utf-8'))
+        batches.append(messages)
+        factory = ticket_factory or (lambda message: {'status': 'ok', 'id': 'ticket'})
+        return _FakeExpoResponse([factory(message) for message in messages])
+
+    with patch('urllib.request.urlopen', side_effect=fake_urlopen):
+        yield batches
