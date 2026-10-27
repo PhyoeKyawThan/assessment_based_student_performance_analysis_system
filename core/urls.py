@@ -26,4 +26,6 @@ urlpatterns = [
     path('api/token/logout/', LogoutView.as_view(), name='token_logout'),
     path('api/', include('users.urls')),
     path('api/', include('catalog.urls')),
+    path('api/', include('teaching.urls')),
+    path('api/', include('marking.urls')),
 ]

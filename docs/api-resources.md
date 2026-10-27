@@ -2,6 +2,8 @@
 
 Routes under `/api/`. Conventions are in [api-conventions.md](api-conventions.md). Analysis reads are in [api-analysis.md](api-analysis.md).
 
+Grade scales and module performances are deferred. [development-plan.md](development-plan.md) ends this phase when a module's `FINAL` distribution is `COMPLETED`, so those two sections are not built yet, and the `module_performance` recompute named in the assessment result rules does not run.
+
 ```mermaid
 flowchart TD
     token["POST /api/token"]

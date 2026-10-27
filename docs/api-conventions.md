@@ -22,6 +22,18 @@ Production cookies:
 
 `Secure` is off when `DEBUG` is true so local HTTP still works. Lifetimes match `SIMPLE_JWT`.
 
+### Browser callers
+
+A page served from another origin can only reach the API if `django-cors-headers` allows it:
+
+| Setting | Value |
+| --- | --- |
+| `CORS_ALLOWED_ORIGINS` | space-separated from the environment, defaulting to the Expo web dev ports `http://localhost:8081`, `:19000`, `:19006` |
+| `CORS_ALLOW_HEADERS` | the defaults plus `client-type`, which selects the table above |
+| `CORS_ALLOW_CREDENTIALS` | `True`, so the cookie path works from an allowed origin |
+
+Without `client-type` in `CORS_ALLOW_HEADERS` the preflight succeeds but the browser still blocks the real request, which surfaces in the client as `TypeError: NetworkError`.
+
 ## Authentication
 
 Login uses email. `users.User.USERNAME_FIELD` is `email`.
@@ -31,7 +43,7 @@ Protected routes accept either:
 1. `Authorization: Bearer <access>`
 2. The `access_token` cookie, only when the Bearer header is absent
 
-Bearer wins when both are present. Cookie fallback is not implemented yet. `JWTAuthentication` reads the header only, so the web client cannot call protected routes until a cookie authentication class is added.
+Bearer wins when both are present. `users.authentication.CookieJWTAuthentication` reads the `access_token` cookie only when no `Authorization` header is sent, so the web client can call protected routes without a token in the body.
 
 Access lifetime is 60 minutes. Refresh lifetime is 7 days. Refresh rotation is on. `BLACKLIST_AFTER_ROTATION` is set, but `rest_framework_simplejwt.token_blacklist` is not installed. Add that app and migrate it before logout or rotation can revoke a refresh token.
 

@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
+from corsheaders.defaults import default_headers
 from dotenv import load_dotenv
 from datetime import timedelta
 import os
@@ -37,6 +38,8 @@ ALLOWED_HOSTS = ['*']
 INSTALLED_APPS = [
     'users',
     'catalog',
+    'teaching',
+    'marking',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -46,6 +49,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
+    'corsheaders',
 ]
 
 REST_FRAMEWORK = {
@@ -72,6 +76,7 @@ SIMPLE_JWT = {
 }
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -80,6 +85,16 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# Browser builds of the mobile client call this API from another origin. Space separated, so the
+# Expo web dev ports work out of the box and production adds its own through the environment.
+CORS_ALLOWED_ORIGINS = os.getenv(
+    'CORS_ALLOWED_ORIGINS',
+    'http://localhost:8081 http://localhost:19000 http://localhost:19006',
+).split()
+CORS_ALLOW_CREDENTIALS = True
+# 'client-type' selects the cookie vs JSON token path, so browsers must be allowed to send it.
+CORS_ALLOW_HEADERS = list(default_headers) + ['client-type']
 
 ROOT_URLCONF = 'core.urls'
 

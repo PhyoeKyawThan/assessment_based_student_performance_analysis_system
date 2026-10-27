@@ -120,8 +120,7 @@ class EnrollmentViewSet(RepresentationMixin, viewsets.ModelViewSet):
         if user.role == User.Role.STUDENT:
             queryset = queryset.filter(student=user)
         elif user.role == User.Role.TEACHER:
-            # Limiting a teacher to their own modules needs lecture_plan, owned by the teaching app.
-            queryset = queryset.none()
+            queryset = queryset.filter(module__lecture_plan__lecturer=user)
 
         for param, lookup in (
             ('module_id', 'module'),
