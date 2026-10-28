@@ -2,16 +2,12 @@ from django.db.models import Sum
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
 
-from catalog.models import Module
+from catalog.models import Module, Semester
 from catalog.serializers import UserBriefSerializer
 from core.exceptions import ConflictError
 from teaching.models import Assessment, AssessmentDistribution, LecturePlan
-from teaching.permissions import owns_plan
+from teaching.permissions import is_admin, owns_plan
 from users.models import User
-
-
-def is_teacher(user):
-    return user.role == User.Role.TEACHER
 
 
 def ensure_draft(plan):
@@ -28,6 +24,13 @@ class PlanModuleSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class PlanSemesterSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Semester
+        fields = ('id', 'semester_no', 'semester_name')
+        read_only_fields = fields
+
+
 class LecturePlanSerializer(serializers.ModelSerializer):
     module_id = serializers.PrimaryKeyRelatedField(
         source='module', queryset=Module.objects.all(), required=False
@@ -36,29 +39,43 @@ class LecturePlanSerializer(serializers.ModelSerializer):
         source='lecturer', queryset=User.objects.all(), required=False
     )
     module = PlanModuleSerializer(read_only=True)
+    semester = PlanSemesterSerializer(source='module.semester', read_only=True)
     lecturer = UserBriefSerializer(read_only=True)
     academic_id = serializers.UUIDField(source='academic.id', read_only=True)
     academic_year = serializers.CharField(source='academic.academic_year', read_only=True)
-    percentage_total = serializers.SerializerMethodField()
+    assessment_total = serializers.SerializerMethodField()
+    total_marks = serializers.SerializerMethodField()
 
     class Meta:
         model = LecturePlan
         fields = (
-            'id', 'module_id', 'module', 'lecturer_id', 'lecturer',
-            'academic_id', 'academic_year', 'note', 'status', 'percentage_total',
+            'id', 'module_id', 'module', 'semester', 'lecturer_id', 'lecturer',
+            'academic_id', 'academic_year', 'note', 'status',
+            'assessment_total', 'total_marks',
         )
         read_only_fields = ('id', 'status', 'academic_id', 'academic_year')
 
-    def get_percentage_total(self, plan):
-        total = getattr(plan, 'percentage_total', None)
+    def get_assessment_total(self, plan):
+        count = getattr(plan, 'assessment_total', None)
+        if count is None:
+            count = Assessment.objects.filter(distribution__lecture_plan=plan).count()
+        return count
+
+    def get_total_marks(self, plan):
+        total = getattr(plan, 'total_marks', None)
         if total is None:
-            total = plan.distributions.aggregate(total=Sum('percentage'))['total']
-        return total or 0
+            total = Assessment.objects.filter(distribution__lecture_plan=plan).aggregate(
+                total=Sum('max_mark')
+            )['total']
+        return f'{total or 0:.2f}'
 
     def validate(self, attrs):
         request = self.context['request']
 
         if self.instance is None:
+            if not is_admin(request.user):
+                raise PermissionDenied('Only an admin may offer a module to a teacher.')
+
             module = attrs.get('module')
             if module is None:
                 raise serializers.ValidationError({'module_id': ['This field is required.']})
@@ -67,23 +84,29 @@ class LecturePlanSerializer(serializers.ModelSerializer):
                     'This module already has a lecture plan.',
                     fields={'module_id': ['A module has at most one lecture plan.']},
                 )
-            attrs['academic'] = module.semester.academic
+
+            academic = module.semester.academic
+            if not academic.is_current:
+                raise serializers.ValidationError(
+                    {
+                        'module_id': [
+                            f'{module.module_code} belongs to academic year '
+                            f'{academic.academic_year}, which is not the current year.'
+                        ]
+                    }
+                )
 
             lecturer = attrs.get('lecturer')
             if lecturer is None:
-                if not is_teacher(request.user):
-                    raise serializers.ValidationError(
-                        {'lecturer_id': ['A lecturer with role TEACHER is required.']}
-                    )
-                lecturer = request.user
-            elif lecturer.role != User.Role.TEACHER:
+                raise serializers.ValidationError(
+                    {'lecturer_id': ['A lecturer with role TEACHER is required.']}
+                )
+            if lecturer.role != User.Role.TEACHER:
                 raise serializers.ValidationError(
                     {'lecturer_id': ['The lecturer must have role TEACHER.']}
                 )
-            if is_teacher(request.user) and lecturer.pk != request.user.pk:
-                raise serializers.ValidationError(
-                    {'lecturer_id': ['A teacher may only plan their own module.']}
-                )
+
+            attrs['academic'] = academic
             attrs['lecturer'] = lecturer
             return attrs
 
@@ -108,18 +131,25 @@ class AssessmentDistributionSerializer(serializers.ModelSerializer):
         source='lecture_plan', queryset=LecturePlan.objects.all()
     )
     assessment_count = serializers.SerializerMethodField()
+    total_marks = serializers.SerializerMethodField()
 
     class Meta:
         model = AssessmentDistribution
         fields = (
-            'id', 'lecture_plan_id', 'assessment_type', 'percentage',
-            'total_assessment', 'display_order', 'status', 'assessment_count',
+            'id', 'lecture_plan_id', 'assessment_type',
+            'total_assessment', 'display_order', 'status', 'assessment_count', 'total_marks',
         )
         read_only_fields = ('id', 'status')
 
     def get_assessment_count(self, distribution):
         count = getattr(distribution, 'assessment_count', None)
         return distribution.assessments.count() if count is None else count
+
+    def get_total_marks(self, distribution):
+        total = getattr(distribution, 'total_marks', None)
+        if total is None:
+            total = distribution.assessments.aggregate(total=Sum('max_mark'))['total']
+        return f'{total or 0:.2f}'
 
     def validate(self, attrs):
         plan = attrs.get('lecture_plan') or self.instance.lecture_plan

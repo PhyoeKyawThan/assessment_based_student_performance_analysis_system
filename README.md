@@ -14,11 +14,14 @@
     - `uv run python3 manage.py migrate`
     - `uv run python3 manage.py runserver`
 
+### Push notifications
+`EXPO_ACCESS_TOKEN` is optional. With it set, `core/notifications.py` posts to Expo's push service when a mark is written or an assessment opens; without it every send is logged and skipped, so a local run never reaches the network. `manage.py test` blanks the token before the suite starts (see `core/test_runner.py`), so no test can deliver for real. See [docs/api-conventions.md](docs/api-conventions.md) for the delivery rules.
+
 ## ER Diagram
 
 Domain model for running assessments. `users` matches the Django `users.User` model (`ADMIN`, `TEACHER`, `STUDENT`). Django `auth_group` and `auth_permission` stay outside this diagram.
 
-A lecture plan is the assessment scheme for one module, owned by one teacher. Each distribution row is one weighted type inside that plan. The model stops when that distribution is complete: every assessment in it, including the final, has a mark for each active enrollment. There is no grade scale, grade point, or GPA.
+A lecture plan is the assessment scheme for one module, offered to one teacher by an admin. Each distribution row is one assessment type inside that plan, and the marks are raw: the module is scored out of the sum of its assessment marks, with no percentage weighting. The model stops when that distribution is complete: every assessment in it, including the final, has a mark for each active enrollment. There is no grade scale, grade point, or GPA.
 
 ```mermaid
 erDiagram

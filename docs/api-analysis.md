@@ -13,15 +13,16 @@ Who can call:
 
 ## Snapshot formula
 
-For one enrollment, group results by `assessment_distribution`.
+For one enrollment, group results by `assessment_distribution`. Marks are raw — a plan carries no weighting — so the module mark is a straight ratio.
 
 ```text
-distribution_ratio   = sum(marks_obtained) / sum(max_mark of assessments that have a result)
-contribution         = distribution_ratio * percentage
-obtained_percentage  = sum(contribution) over distributions that have at least one result
+type_ratio           = sum(marks_obtained) / sum(max_mark of assessments that have a result)
+obtained_marks       = sum(marks_obtained) over the enrollment
+available_marks      = sum(max_mark of assessments that have a result)
+obtained_percentage  = obtained_marks / available_marks * 100
 ```
 
-Missing results are left out of both sums. The snapshot then understates the final module mark until those items are graded. The response field `coverage_percentage` is the sum of `percentage` for distributions that have at least one result for this student, so a client can show "40 of 100 weight marked".
+Missing results are left out of both sums. The snapshot then understates the final module mark until those items are graded. The response field `coverage_percentage` is `available_marks / total_marks * 100` for the plan, so a client can show "20 of 30 marks graded".
 
 `obtained_percentage` is rounded to two decimal places, half up.
 
@@ -83,10 +84,9 @@ Query: `academic_id` optional. Without it, every snapshot for that student is re
           "components": [
             {
               "assessment_type": "QUIZ",
-              "percentage": 20,
               "marks_obtained": "62.00",
               "max_mark": "80.00",
-              "contribution": "15.50"
+              "type_ratio": "77.50"
             }
           ]
         }
@@ -133,7 +133,7 @@ Cohort for one module. Students with no snapshot are counted in `unenrolled_mark
   "components": [
     {
       "assessment_type": "QUIZ",
-      "percentage": 20,
+      "total_marks": "80.00",
       "average_ratio": "0.78"
     }
   ],
@@ -153,7 +153,7 @@ Cohort for one module. Students with no snapshot are counted in `unenrolled_mark
 
 `students` is paginated with the shared page contract. Summary fields (`cohort_size`, averages, `grade_distribution`, `components`) describe the full cohort, not the current page.
 
-`average_ratio` is the mean of per-student `distribution_ratio` for students who have at least one result in that type.
+`average_ratio` is the mean of per-student `type_ratio` for students who have at least one result in that type.
 
 Median is the mean of the two central values when `with_snapshot` is even.
 

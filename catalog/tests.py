@@ -2,6 +2,7 @@ from django.test import TestCase
 
 from catalog.models import Academic, Enrollment, Module, Semester
 from core.testing import api_client, make_user
+from teaching.models import LecturePlan
 from users.models import User
 
 ACADEMIC_PAYLOAD = {
@@ -262,6 +263,53 @@ class ModuleTests(AdminOnlyClientMixin, CatalogFixtureMixin, TestCase):
             [row['module_code'] for row in self.client.get('/api/modules/?search=circ').data['results']],
             ['EE300'],
         )
+
+    def test_lecture_plan_names_the_responsible_teacher(self):
+        module = self.make_module(self.semester)
+        teacher = make_user(role=User.Role.TEACHER)
+        LecturePlan.objects.create(
+            module=module, lecturer=teacher, academic=self.semester.academic
+        )
+
+        row = self.client.get(f'/api/modules/{module.pk}/').data
+
+        self.assertEqual(set(row['lecture_plan']), {'id', 'status', 'lecturer'})
+        self.assertEqual(row['lecture_plan']['lecturer']['id'], str(teacher.pk))
+
+    def test_an_unassigned_module_reports_no_lecture_plan(self):
+        self.make_module(self.semester)
+
+        row = self.client.get('/api/modules/').data['results'][0]
+
+        self.assertIsNone(row['lecture_plan'])
+
+    def test_assignment_filters(self):
+        teacher = make_user(role=User.Role.TEACHER)
+        assigned = self.make_module(self.semester, module_code='CS101')
+        LecturePlan.objects.create(
+            module=assigned, lecturer=teacher, academic=self.semester.academic
+        )
+        self.make_module(self.semester, module_code='CS202')
+
+        for query, expected in (
+            ('?planned=true', ['CS101']),
+            ('?planned=false', ['CS202']),
+            (f'?lecturer_id={teacher.pk}', ['CS101']),
+        ):
+            rows = self.client.get(f'/api/modules/{query}').data['results']
+            self.assertEqual([row['module_code'] for row in rows], expected, query)
+
+    def test_current_year_filter(self):
+        past = self.make_academic(
+            academic_year='2025-2026', is_current=False,
+            start_date='2025-12-01', end_date='2026-09-30',
+        )
+        self.make_module(self.make_semester(past), module_code='CS001')
+        self.make_module(self.semester, module_code='CS101')
+
+        rows = self.client.get('/api/modules/?current_year=true').data['results']
+
+        self.assertEqual([row['module_code'] for row in rows], ['CS101'])
 
     def test_malformed_filter_is_400(self):
         response = self.client.get('/api/modules/?academic_id=not-a-uuid')

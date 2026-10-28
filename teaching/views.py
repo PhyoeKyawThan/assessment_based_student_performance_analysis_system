@@ -1,5 +1,4 @@
 from django.db.models import Count, Q, Sum
-from django.db.models.functions import Coalesce
 from django.db.transaction import atomic
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -40,9 +39,10 @@ def readable_plan_filter(prefix, user):
 class LecturePlanViewSet(RepresentationMixin, viewsets.ModelViewSet):
     queryset = LecturePlan.objects.select_related(
         'module__semester__academic', 'lecturer'
-    ).annotate(percentage_total=Coalesce(Sum('distributions__percentage'), 0)).order_by(
-        'module__module_code'
-    )
+    ).annotate(
+        assessment_total=Count('distributions__assessments'),
+        total_marks=Sum('distributions__assessments__max_mark'),
+    ).order_by('module__module_code')
     serializer_class = LecturePlanSerializer
     representation_serializer_class = LecturePlanSerializer
     permission_classes = (IsPlanWriter,)
@@ -55,6 +55,7 @@ class LecturePlanViewSet(RepresentationMixin, viewsets.ModelViewSet):
             ('module_id', 'module'),
             ('lecturer_id', 'lecturer'),
             ('academic_id', 'academic'),
+            ('semester_id', 'module__semester'),
         ):
             raw = params.get(param)
             if raw not in (None, ''):
@@ -104,7 +105,10 @@ class LecturePlanViewSet(RepresentationMixin, viewsets.ModelViewSet):
 class AssessmentDistributionViewSet(RepresentationMixin, viewsets.ModelViewSet):
     queryset = AssessmentDistribution.objects.select_related(
         'lecture_plan'
-    ).annotate(assessment_count=Count('assessments')).order_by('lecture_plan', 'display_order')
+    ).annotate(
+        assessment_count=Count('assessments'),
+        total_marks=Sum('assessments__max_mark'),
+    ).order_by('lecture_plan', 'display_order')
     serializer_class = AssessmentDistributionSerializer
     representation_serializer_class = AssessmentDistributionSerializer
     permission_classes = (IsPlanWriter,)
@@ -198,15 +202,25 @@ class MyLecturePlansView(ListAPIView):
     serializer_class = LecturePlanSerializer
 
     def get_queryset(self):
-        queryset = LecturePlan.objects.select_related(
-            'module__semester__academic', 'lecturer'
-        ).filter(lecturer=self.request.user)
+        queryset = (
+            LecturePlan.objects.select_related('module__semester__academic', 'lecturer')
+            .annotate(
+                assessment_total=Count('distributions__assessments'),
+                total_marks=Sum('distributions__assessments__max_mark'),
+            )
+            .filter(lecturer=self.request.user)
+            .order_by('module__module_code')
+        )
         params = self.request.query_params
 
         status_value = params.get('status')
         if status_value:
             queryset = queryset.filter(status=status_value)
-        raw = params.get('academic_id')
-        if raw not in (None, ''):
-            queryset = queryset.filter(academic=uuid_param('academic_id', raw))
+        for param, lookup in (
+            ('academic_id', 'academic'),
+            ('semester_id', 'module__semester'),
+        ):
+            raw = params.get(param)
+            if raw not in (None, ''):
+                queryset = queryset.filter(**{lookup: uuid_param(param, raw)})
         return queryset

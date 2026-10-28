@@ -1,7 +1,7 @@
 import uuid
 
 from django.conf import settings
-from django.core.validators import MaxValueValidator, MinValueValidator
+from django.core.validators import MinValueValidator
 from django.db import models
 
 from catalog.models import Academic, Module
@@ -43,14 +43,7 @@ class LecturePlan(models.Model):
             errors.setdefault(field, []).append(message)
 
         if not distributions:
-            add('distributions', ['The plan has no assessment distribution.'])
-
-        total = sum(distribution.percentage for distribution, _ in distributions)
-        if distributions and total != 100:
-            add(
-                'percentage_total',
-                [f'Distribution percentages sum to {total}. They must sum to 100.'],
-            )
+            add('distributions', ['The plan has no assessment type.'])
 
         for distribution, assessments in distributions:
             label = distribution.assessment_type
@@ -111,9 +104,6 @@ class AssessmentDistribution(models.Model):
         LecturePlan, on_delete=models.PROTECT, related_name='distributions'
     )
     assessment_type = models.CharField(max_length=20, choices=AssessmentType.choices)
-    percentage = models.PositiveSmallIntegerField(
-        validators=[MinValueValidator(1), MaxValueValidator(100)]
-    )
     total_assessment = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
     display_order = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
     status = models.CharField(
@@ -134,7 +124,7 @@ class AssessmentDistribution(models.Model):
         ]
 
     def __str__(self):
-        return f'{self.assessment_type} {self.percentage}% of {self.lecture_plan}'
+        return f'{self.assessment_type} x{self.total_assessment} of {self.lecture_plan}'
 
 
 class Assessment(models.Model):

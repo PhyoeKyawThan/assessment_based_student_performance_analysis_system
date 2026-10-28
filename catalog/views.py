@@ -65,7 +65,9 @@ class SemesterViewSet(RepresentationMixin, viewsets.ModelViewSet):
 
 
 class ModuleViewSet(RepresentationMixin, viewsets.ModelViewSet):
-    queryset = Module.objects.select_related('semester__academic')
+    queryset = Module.objects.select_related(
+        'semester__academic', 'lecture_plan__lecturer'
+    )
     serializer_class = ModuleSerializer
     representation_serializer_class = ModuleSerializer
     permission_classes = (IsAdminRoleOrReadOnly,)
@@ -84,6 +86,22 @@ class ModuleViewSet(RepresentationMixin, viewsets.ModelViewSet):
         raw = params.get('academic_id')
         if raw not in (None, ''):
             queryset = queryset.filter(semester__academic=uuid_param('academic_id', raw))
+
+        raw = params.get('lecturer_id')
+        if raw not in (None, ''):
+            queryset = queryset.filter(lecture_plan__lecturer=uuid_param('lecturer_id', raw))
+
+        raw = params.get('current_year')
+        if raw not in (None, ''):
+            queryset = queryset.filter(
+                semester__academic__is_current=bool_param('current_year', raw)
+            )
+
+        raw = params.get('planned')
+        if raw not in (None, ''):
+            queryset = queryset.filter(
+                lecture_plan__isnull=not bool_param('planned', raw)
+            )
 
         search = params.get('search')
         if search:

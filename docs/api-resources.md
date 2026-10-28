@@ -111,7 +111,7 @@ Student only. Same row shape as [enrollments](#enrollments), already limited to 
 
 ### `GET /api/me/lecture-plans/`
 
-Teacher only. Same row shape as [lecture plans](#lecture-plans), limited to `lecturer_id` of the caller. Optional `status` and `academic_id`.
+Teacher only. Same row shape as [lecture plans](#lecture-plans), limited to `lecturer_id` of the caller. Optional `status`, `academic_id` and `semester_id`.
 
 ### `GET /api/me/performance/`
 
@@ -292,7 +292,7 @@ Response:
 | `PATCH` | `/api/modules/{id}/` | yes | no | no |
 | `DELETE` | `/api/modules/{id}/` | yes | no | no |
 
-Filters: `semester_id`, `academic_id`, `search` on `module_code` and `module_name`.
+Filters: `semester_id`, `academic_id`, `lecturer_id`, `search` on `module_code` and `module_name`, `current_year` (boolean, keeps modules whose semester belongs to the current academic year), and `planned` (boolean, whether a lecture plan already exists).
 
 ```json
 {
@@ -309,7 +309,26 @@ Rules:
 - `credit_hours` is an integer from 1 to 30.
 - Delete returns `409` when a lecture plan or enrollment exists.
 
-Response includes `id`, `semester_id`, `academic_id`, and `academic_year`.
+Response includes `id`, `semester_id`, `academic_id`, and `academic_year`, plus `lecture_plan`, which names the teacher the module was offered to:
+
+```json
+{
+  "id": "<uuid>",
+  "semester_id": "<uuid>",
+  "academic_id": "<uuid>",
+  "academic_year": "2026-2027",
+  "module_code": "CS101",
+  "module_name": "Programming Fundamentals",
+  "credit_hours": 3,
+  "lecture_plan": {
+    "id": "<uuid>",
+    "status": "DRAFT",
+    "lecturer": { "id": "<uuid>", "full_name": "U Hla", "email": "hla@university.edu" }
+  }
+}
+```
+
+`lecture_plan` is `null` until an admin offers the module. It is read-only: the plan itself is written through [lecture plans](#lecture-plans).
 
 ## Grade scales
 
@@ -345,17 +364,17 @@ Rules:
 
 ## Lecture plans
 
-One plan per module. `academic_id` is stored and returned, and the server sets it from the module's semester. Clients do not send it.
+One plan per module, and one teacher per plan. The admin **offers** a module — that creates the plan with its lecturer and the module's academic year — and the teacher then fills in the assessments. `academic_id` is stored and returned, and the server sets it from the module's semester. Clients do not send it.
 
 | Method | Path | Admin | Teacher | Student |
 | --- | --- | --- | --- | --- |
 | `GET` | `/api/lecture-plans/` | all | own | enrolled modules, `PUBLISHED` only |
-| `POST` | `/api/lecture-plans/` | yes | own `lecturer_id` | no |
+| `POST` | `/api/lecture-plans/` | yes | no | no |
 | `GET` | `/api/lecture-plans/{id}/` | yes | own | published and enrolled |
 | `PATCH` | `/api/lecture-plans/{id}/` | yes | own, `note` and `status` only through the actions below | no |
 | `DELETE` | `/api/lecture-plans/{id}/` | `DRAFT` only | own `DRAFT` only | no |
 
-Filters: `module_id`, `lecturer_id`, `academic_id`, `status`.
+Filters: `module_id`, `lecturer_id`, `academic_id`, `semester_id`, `status`.
 
 Create:
 
@@ -367,7 +386,7 @@ Create:
 }
 ```
 
-A teacher may omit `lecturer_id`. The server uses the caller. An admin must send a user whose role is `TEACHER`. A second plan for the same module returns `409`.
+Only an admin may create a plan; a teacher or student `POST` returns `403`. `lecturer_id` is required and must name a `TEACHER`. The module must belong to the current academic year (`Academic.is_current`), otherwise `400` on `module_id`. A second plan for the same module returns `409`.
 
 Response:
 
@@ -380,6 +399,7 @@ Response:
     "module_name": "Programming Fundamentals",
     "credit_hours": 3
   },
+  "semester": { "id": "<uuid>", "semester_no": 1, "semester_name": "First Semester" },
   "lecturer": {
     "id": "<uuid>",
     "full_name": "U Hla",
@@ -389,11 +409,12 @@ Response:
   "academic_year": "2026-2027",
   "note": "Weekly quiz, one midterm, one final.",
   "status": "DRAFT",
-  "percentage_total": 0
+  "assessment_total": 0,
+  "total_marks": "0.00"
 }
 ```
 
-`percentage_total` is the sum of child distribution percentages. It is read-only.
+`semester` is read from the module, and `status` is the planning state: `DRAFT` means the teacher is still writing the scheme, `PUBLISHED` means the module's assessment run is fixed. `assessment_total` and `total_marks` are read-only roll-ups of the child assessments — `total_marks` is the raw marks the module is scored out of, a two-decimal string.
 
 `PATCH` on a `DRAFT` plan may change `note` and, for an admin, `lecturer_id`. `note` remains editable after publish. `module_id` never changes.
 
@@ -404,13 +425,12 @@ Admin or the owning teacher. Empty body.
 The plan moves to `PUBLISHED` only when all of these hold:
 
 - At least one distribution exists.
-- Percentages are integers from 1 to 100 and sum to 100.
 - `(lecture_plan_id, assessment_type)` is unique. This is also enforced on write.
 - Each distribution's `total_assessment` equals the number of child assessments.
 - Each distribution's `sequence_no` values are unique and run from 1 through `total_assessment`.
 - Every assessment has `max_mark` greater than 0 and a title.
 
-`409` returns `fields` for each failed check. The plan stays `DRAFT`.
+Marks are raw, so any `total_marks` publishes — a module of three 10-mark quizzes is simply scored out of 30. `409` returns `fields` for each failed check. The plan stays `DRAFT`.
 
 ### `POST /api/lecture-plans/{id}/revert-to-draft/`
 
@@ -425,7 +445,7 @@ stateDiagram-v2
 
 ## Assessment distributions
 
-A row is one weighted type inside a plan: `QUIZ`, `ASSIGNMENT`, `LAB`, `PRESENTATION`, `MIDTERM`, or `FINAL`.
+A row is one assessment type inside a plan: `QUIZ`, `ASSIGNMENT`, `LAB`, `PRESENTATION`, `MIDTERM`, or `FINAL`. It groups the assessments the teacher writes; it carries no weight.
 
 | Method | Path | Who can write |
 | --- | --- | --- |
@@ -439,15 +459,16 @@ A row is one weighted type inside a plan: `QUIZ`, `ASSIGNMENT`, `LAB`, `PRESENTA
 {
   "lecture_plan_id": "<uuid>",
   "assessment_type": "QUIZ",
-  "percentage": 20,
   "total_assessment": 4,
   "display_order": 1
 }
 ```
 
-`percentage` is an integer. `total_assessment` is the number of assessment rows the teacher will create. `display_order` is unique inside the plan.
+`total_assessment` is the number of assessment rows the teacher will create, `display_order` is unique inside the plan. The response adds `assessment_count` and `total_marks` (a two-decimal string: the raw marks of the child assessments so far).
 
-After publish, percentage, type, and `total_assessment` are frozen. `409` on a write that would change them.
+There is no percentage field. A payload that sends one is ignored, and the response never returns one.
+
+After publish, type, `total_assessment`, and `display_order` are frozen. `409` on a write that would change them.
 
 ## Assessments
 
@@ -598,7 +619,7 @@ Rules:
 - After a successful write or delete, recompute `module_performance` for that enrollment.
 - A `POST`, `PATCH`, or `bulk` write notifies the marked students who registered a push token.
 
-Response adds `id`, `graded_by` (`id`, `full_name`), `graded_at`, `max_mark`, and `percentage` for this item only (`marks_obtained / max_mark * 100`, one decimal string). That item percentage is not the module weight.
+Response adds `id`, `graded_by` (`id`, `full_name`), `graded_at`, `max_mark`, and `percentage` for this item only (`marks_obtained / max_mark * 100`, one decimal string). That item percentage is not the module's overall mark.
 
 ### `POST /api/assessment-results/bulk/`
 

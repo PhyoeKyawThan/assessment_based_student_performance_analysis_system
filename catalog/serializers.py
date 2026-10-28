@@ -83,14 +83,26 @@ class ModuleSerializer(serializers.ModelSerializer):
     academic_year = serializers.CharField(
         source='semester.academic.academic_year', read_only=True
     )
+    lecture_plan = serializers.SerializerMethodField()
 
     class Meta:
         model = Module
         fields = (
             'id', 'semester_id', 'academic_id', 'academic_year',
-            'module_code', 'module_name', 'credit_hours',
+            'module_code', 'module_name', 'credit_hours', 'lecture_plan',
         )
         read_only_fields = ('id', 'academic_id', 'academic_year')
+
+    def get_lecture_plan(self, module):
+        """Who the module was offered to, or None while the admin has not assigned it yet."""
+        plan = getattr(module, 'lecture_plan', None)
+        if plan is None:
+            return None
+        return {
+            'id': str(plan.id),
+            'status': plan.status,
+            'lecturer': UserBriefSerializer(plan.lecturer).data,
+        }
 
 
 class UserBriefSerializer(serializers.ModelSerializer):

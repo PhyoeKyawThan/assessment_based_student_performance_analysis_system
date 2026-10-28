@@ -8,7 +8,6 @@ from users.models import User
 
 DISTRIBUTION_PAYLOAD = {
     'assessment_type': 'QUIZ',
-    'percentage': 100,
     'total_assessment': 1,
     'display_order': 1,
 }
@@ -54,14 +53,14 @@ class TeachingFixtureMixin(CatalogFixtureMixin):
     def make_publishable_plan(self, **overrides):
         plan = self.make_plan(**overrides)
         quiz = self.make_distribution(
-            plan=plan, assessment_type='QUIZ', percentage=20, total_assessment=2, display_order=1
+            plan=plan, assessment_type='QUIZ', total_assessment=2, display_order=1
         )
         for sequence in (1, 2):
             self.make_assessment(
                 distribution=quiz, title=f'Quiz {sequence}', sequence_no=sequence
             )
         final = self.make_distribution(
-            plan=plan, assessment_type='FINAL', percentage=80, total_assessment=1, display_order=2
+            plan=plan, assessment_type='FINAL', total_assessment=1, display_order=2
         )
         self.make_assessment(
             distribution=final, title='Final exam', sequence_no=1, max_mark='100.00'
@@ -113,27 +112,45 @@ class LecturePlanTests(TeachingFixtureMixin, TestCase):
         self.assertEqual(response.data['status'], 'DRAFT')
         self.assertEqual(response.data['academic_id'], str(self.module.semester.academic_id))
         self.assertEqual(response.data['academic_year'], '2026-2027')
-        self.assertEqual(response.data['percentage_total'], 0)
+        self.assertEqual(response.data['semester']['id'], str(self.module.semester_id))
+        self.assertEqual(response.data['assessment_total'], 0)
+        self.assertEqual(response.data['total_marks'], '0.00')
         self.assertEqual(
             set(response.data['module']),
             {'id', 'module_code', 'module_name', 'credit_hours'},
         )
+        self.assertEqual(set(response.data['semester']), {'id', 'semester_no', 'semester_name'})
         self.assertEqual(set(response.data['lecturer']), {'id', 'full_name', 'email'})
 
-    def test_teacher_creates_for_self_without_lecturer_id(self):
-        response = api_client(self.teacher).post(
-            '/api/lecture-plans/', {'module_id': str(self.module.pk)}, format='json'
-        )
-
-        self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(response.data['lecturer']['id'], str(self.teacher.pk))
-
-    def test_teacher_cannot_plan_for_another_teacher(self):
+    def test_only_an_admin_may_offer_a_module(self):
         response = api_client(self.teacher).post(
             '/api/lecture-plans/',
-            {'module_id': str(self.module.pk), 'lecturer_id': str(self.other_teacher.pk)},
+            {'module_id': str(self.module.pk), 'lecturer_id': str(self.teacher.pk)},
             format='json',
         )
+
+        self.assertEqual(response.status_code, 403, response.data)
+        self.assertEqual(response.data['code'], 'permission_denied')
+        self.assertEqual(LecturePlan.objects.count(), 0)
+
+    def test_a_module_of_a_past_academic_year_cannot_be_offered(self):
+        past = self.make_academic(
+            academic_year='2025-2026', is_current=False,
+            start_date='2025-12-01', end_date='2026-09-30',
+        )
+        module = self.make_module(semester=self.make_semester(academic=past))
+
+        response = self.client.post(
+            '/api/lecture-plans/',
+            {'module_id': str(module.pk), 'lecturer_id': str(self.teacher.pk)},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn('module_id', response.data['fields'])
+
+    def test_lecturer_id_is_required(self):
+        response = self.create(lecturer_id=None)
 
         self.assertEqual(response.status_code, 400, response.data)
         self.assertIn('lecturer_id', response.data['fields'])
@@ -202,6 +219,7 @@ class LecturePlanTests(TeachingFixtureMixin, TestCase):
             (f'?module_id={mine.module_id}', [mine.pk]),
             (f'?lecturer_id={theirs.lecturer_id}', [theirs.pk]),
             (f'?academic_id={mine.academic_id}', [mine.pk, theirs.pk]),
+            (f'?semester_id={mine.module.semester_id}', [mine.pk, theirs.pk]),
             ('?status=PUBLISHED', [theirs.pk]),
         ):
             rows = self.client.get(f'/api/lecture-plans/{query}').data['results']
@@ -307,7 +325,8 @@ class LecturePlanTests(TeachingFixtureMixin, TestCase):
 
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data['status'], 'PUBLISHED')
-        self.assertEqual(response.data['percentage_total'], 100)
+        self.assertEqual(response.data['assessment_total'], 3)
+        self.assertEqual(response.data['total_marks'], '120.00')
 
     def test_publish_needs_at_least_one_distribution(self):
         plan = self.make_plan(lecturer=self.teacher)
@@ -318,21 +337,19 @@ class LecturePlanTests(TeachingFixtureMixin, TestCase):
         self.assertIn('distributions', response.data['fields'])
         self.assertEqual(LecturePlan.objects.get(pk=plan.pk).status, LecturePlan.Status.DRAFT)
 
-    def test_publish_needs_percentages_to_sum_to_100(self):
+    def test_publish_needs_no_weighting_and_accepts_any_mark_total(self):
         plan = self.make_plan(lecturer=self.teacher)
-        self.make_distribution(plan=plan, percentage=30)
+        distribution = self.make_distribution(plan=plan)
+        self.make_assessment(distribution=distribution, max_mark='7.50')
 
         response = self.client.post(f'/api/lecture-plans/{plan.pk}/publish/', {}, format='json')
 
-        self.assertEqual(response.status_code, 409, response.data)
-        self.assertEqual(
-            response.data['fields']['percentage_total'],
-            ['Distribution percentages sum to 30. They must sum to 100.'],
-        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['total_marks'], '7.50')
 
     def test_publish_needs_each_type_to_be_complete(self):
         plan = self.make_plan(lecturer=self.teacher)
-        self.make_distribution(plan=plan, percentage=100, total_assessment=2)
+        self.make_distribution(plan=plan, total_assessment=2)
         self.make_assessment(distribution=plan.distributions.first(), title='Quiz 4', sequence_no=4)
 
         response = self.client.post(f'/api/lecture-plans/{plan.pk}/publish/', {}, format='json')
@@ -346,7 +363,7 @@ class LecturePlanTests(TeachingFixtureMixin, TestCase):
 
     def test_publish_needs_positive_max_mark(self):
         plan = self.make_plan(lecturer=self.teacher)
-        distribution = self.make_distribution(plan=plan, percentage=100)
+        distribution = self.make_distribution(plan=plan)
         self.make_assessment(distribution=distribution, max_mark='0.00')
 
         response = self.client.post(f'/api/lecture-plans/{plan.pk}/publish/', {}, format='json')
@@ -432,12 +449,19 @@ class AssessmentDistributionTests(TeachingFixtureMixin, TestCase):
     def test_create(self):
         self.make_distribution(plan=self.plan, assessment_type='QUIZ', display_order=1)
 
-        response = self.create(assessment_type='ASSIGNMENT', percentage=40)
+        response = self.create(assessment_type='ASSIGNMENT')
 
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(response.data['status'], 'PENDING')
         self.assertEqual(response.data['assessment_count'], 0)
+        self.assertEqual(response.data['total_marks'], '0.00')
         self.assertEqual(str(response.data['lecture_plan_id']), str(self.plan.pk))
+
+    def test_a_percentage_in_the_payload_is_ignored(self):
+        response = self.create(assessment_type='LAB', display_order=5, percentage=40)
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertNotIn('percentage', response.data)
 
     def test_duplicate_type_is_conflict(self):
         self.make_distribution(plan=self.plan, assessment_type='ASSIGNMENT')
@@ -453,11 +477,11 @@ class AssessmentDistributionTests(TeachingFixtureMixin, TestCase):
 
         self.assertEqual(response.status_code, 409, response.data)
 
-    def test_percentage_bounds(self):
-        for percentage in (0, 101):
-            response = self.create(percentage=percentage, display_order=5)
+    def test_counts_must_be_positive(self):
+        for field, value in (('total_assessment', 0), ('display_order', 0)):
+            response = self.create(**{field: value, 'assessment_type': 'LAB'})
             self.assertEqual(response.status_code, 400, response.data)
-            self.assertIn('percentage', response.data['fields'])
+            self.assertIn(field, response.data['fields'])
 
     def test_adding_to_another_teachers_plan_is_forbidden(self):
         foreign = self.make_plan(
@@ -477,10 +501,10 @@ class AssessmentDistributionTests(TeachingFixtureMixin, TestCase):
         self.make_assessment(distribution=distribution)
         self.client.post(f'/api/lecture-plans/{self.plan.pk}/publish/', {}, format='json')
 
-        create = self.create(assessment_type='LAB', percentage=50, display_order=3)
+        create = self.create(assessment_type='LAB', display_order=3)
         patch = self.client.patch(
             f'/api/assessment-distributions/{distribution.pk}/',
-            {'percentage': 55},
+            {'total_assessment': 5},
             format='json',
         )
         delete = self.client.delete(f'/api/assessment-distributions/{distribution.pk}/')

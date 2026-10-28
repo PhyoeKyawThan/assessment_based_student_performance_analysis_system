@@ -83,14 +83,14 @@ sequenceDiagram
         T->>API: POST /api/assessments/ until count matches total_assessment
     end
     T->>API: POST /api/lecture-plans/{id}/publish/
-    alt percentages sum to 100 and rows are complete
+    alt every type is complete and marks are positive
         API-->>T: 200 PUBLISHED
     else checks fail
         API-->>T: 409 fields, still DRAFT
     end
 ```
 
-A student does not see the plan until it is `PUBLISHED` and they are enrolled. Who creates the plan (admin assigns, or the teacher creates their own) follows the rule in api-resources.md.
+A student does not see the plan until it is `PUBLISHED` and they are enrolled. Only an admin creates a plan — offering a module assigns its teacher — and the teacher then fills in the assessments.
 
 ## Record marks
 
