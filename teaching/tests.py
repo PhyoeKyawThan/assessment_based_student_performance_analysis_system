@@ -117,7 +117,7 @@ class LecturePlanTests(TeachingFixtureMixin, TestCase):
         self.assertEqual(response.data['total_marks'], '0.00')
         self.assertEqual(
             set(response.data['module']),
-            {'id', 'module_code', 'module_name'},
+            {'id', 'module_code', 'module_name', 'study_year'},
         )
         self.assertEqual(set(response.data['semester']), {'id', 'semester_no', 'semester_name'})
         self.assertEqual(set(response.data['lecturer']), {'id', 'full_name', 'email'})

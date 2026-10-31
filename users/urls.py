@@ -1,10 +1,17 @@
 from django.urls import path
 from rest_framework.routers import SimpleRouter
 
-from users.views import MyAcademicHistoryView, MePushTokenView, MeView, UserViewSet
+from users.views import (
+    MyAcademicHistoryView,
+    MePushTokenView,
+    MeView,
+    NotificationViewSet,
+    UserViewSet,
+)
 
 router = SimpleRouter()
 router.register('users', UserViewSet, basename='user')
+router.register('notifications', NotificationViewSet, basename='notification')
 
 urlpatterns = [
     path('me/', MeView.as_view(), name='me'),

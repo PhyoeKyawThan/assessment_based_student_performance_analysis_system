@@ -101,6 +101,10 @@ One token per account: a second device replaces the first, which is what a reins
 
 Forget this account's device. `204`. The mobile app calls this on sign-out.
 
+### `DELETE /api/me/`
+
+Disable and anonymize the caller's account. The response is `204`. Historical assessment, teaching, and notification records remain attached to the anonymized user so institutional records are not lost.
+
 ### `PATCH /api/me/`
 
 Fields: `full_name`, and password change via `current_password` plus `new_password`. A user cannot change `role`, `email`, `username`, or `is_active` here.
@@ -116,6 +120,40 @@ Teacher only. Same row shape as [lecture plans](#lecture-plans), limited to `lec
 ### `GET /api/me/performance/`
 
 Student only. Query `academic_id` optional. Same payload as the student analysis route for the caller. See [api-analysis.md](api-analysis.md).
+
+## Persistent notifications
+
+Notifications are stored in the database before push delivery is attempted. Push is only a device alert; every recipient keeps an inbox row with independent read and acknowledgement timestamps.
+
+### `GET /api/notifications/`
+
+The caller's inbox. Add `?unread=true` to return only unread items. All roles may read their inbox.
+
+### `POST /api/notifications/`
+
+Admins and teachers only. Fields are `title`, `body`, `requires_acknowledgement`, and exactly one audience selector:
+
+- `recipient_ids`: explicit user IDs. Admins may select any active user; teachers may select only students enrolled in a module they teach.
+- `target_role`: admin only; one of `ALL`, `TEACHER`, or `STUDENT`.
+- `module_id`: teachers may send to active students enrolled in that teacher's module; admins may target any module.
+
+The API creates one `NotificationRecipient` relationship per eligible recipient and then sends Expo push messages to recipients with registered device tokens.
+
+### `GET /api/notifications/sent/`
+
+Admin and teacher outbox, limited to notifications sent by the caller. Each item includes recipient, read, acknowledgement, and accepted push-delivery counts.
+
+### `GET /api/notifications/eligible-recipients/`
+
+Users the caller is allowed to select for an individual message. Students receive `403`.
+
+### `POST /api/notifications/{recipient-row-id}/mark-read/`
+
+Marks the caller's inbox relationship as read. Returns the updated inbox item.
+
+### `POST /api/notifications/{recipient-row-id}/acknowledge/`
+
+Records acknowledgement for an item that requires it and also marks it read. Returns `400` if acknowledgement was not requested.
 
 ## Dashboard
 

@@ -4,7 +4,7 @@ import re
 
 from rest_framework import serializers
 
-from users.models import User
+from users.models import Notification, NotificationRecipient, User
 
 PUSH_TOKEN_PATTERN = re.compile(r'^Expo(nent)?PushToken\[[^\]\s]{1,128}\]$')
 
@@ -101,3 +101,83 @@ class UserAdminUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ('full_name', 'role', 'is_active', 'email', 'username')
+
+
+class NotificationSenderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ('id', 'full_name', 'role')
+        read_only_fields = fields
+
+
+class NotificationRecipientSerializer(serializers.ModelSerializer):
+    sender = NotificationSenderSerializer(source='notification.sender', read_only=True)
+    title = serializers.CharField(source='notification.title', read_only=True)
+    body = serializers.CharField(source='notification.body', read_only=True)
+    requires_acknowledgement = serializers.BooleanField(
+        source='notification.requires_acknowledgement', read_only=True
+    )
+    created_at = serializers.DateTimeField(source='notification.created_at', read_only=True)
+
+    class Meta:
+        model = NotificationRecipient
+        fields = (
+            'id', 'sender', 'title', 'body', 'requires_acknowledgement',
+            'created_at', 'read_at', 'acknowledged_at',
+        )
+        read_only_fields = fields
+
+
+class NotificationSentSerializer(serializers.ModelSerializer):
+    sender = NotificationSenderSerializer(read_only=True)
+    recipient_count = serializers.SerializerMethodField()
+    read_count = serializers.SerializerMethodField()
+    acknowledged_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Notification
+        fields = (
+            'id', 'sender', 'title', 'body', 'requires_acknowledgement',
+            'delivery_count', 'recipient_count', 'read_count',
+            'acknowledged_count', 'created_at',
+        )
+        read_only_fields = fields
+
+    def get_recipient_count(self, notification):
+        return notification.recipient_rows.count()
+
+    def get_read_count(self, notification):
+        return notification.recipient_rows.filter(read_at__isnull=False).count()
+
+    def get_acknowledged_count(self, notification):
+        return notification.recipient_rows.filter(acknowledged_at__isnull=False).count()
+
+
+class NotificationCreateSerializer(serializers.Serializer):
+    title = serializers.CharField(max_length=150)
+    body = serializers.CharField(max_length=2000)
+    requires_acknowledgement = serializers.BooleanField(default=False)
+    recipient_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False, allow_empty=False
+    )
+    target_role = serializers.ChoiceField(
+        choices=('ALL', User.Role.TEACHER, User.Role.STUDENT), required=False
+    )
+    module_id = serializers.UUIDField(required=False)
+
+    def validate(self, attrs):
+        request = self.context['request']
+        targets = [
+            bool(attrs.get('recipient_ids')),
+            bool(attrs.get('target_role')),
+            bool(attrs.get('module_id')),
+        ]
+        if sum(targets) != 1:
+            raise serializers.ValidationError(
+                'Choose exactly one target: recipients, role, or module.'
+            )
+        if request.user.role == User.Role.STUDENT:
+            raise serializers.ValidationError('Students cannot send notifications.')
+        if request.user.role == User.Role.TEACHER and attrs.get('target_role'):
+            raise serializers.ValidationError('Teachers cannot send role-wide notifications.')
+        return attrs

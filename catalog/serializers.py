@@ -363,7 +363,7 @@ class SetupModuleSerializer(serializers.Serializer):
     study_year = serializers.IntegerField(min_value=1, max_value=5)
     semester_no = serializers.IntegerField(min_value=1, max_value=2)
     major_codes = serializers.ListField(
-        child=serializers.CharField(max_length=32), allow_empty=False
+        child=serializers.CharField(max_length=32), allow_empty=True
     )
 
 

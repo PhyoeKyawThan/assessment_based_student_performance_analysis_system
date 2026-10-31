@@ -1,7 +1,7 @@
 from django.test import TestCase
 
 from core.testing import PASSWORD, api_client, make_user
-from users.models import User
+from users.models import Notification, NotificationRecipient, User
 
 
 class LoginTests(TestCase):
@@ -240,6 +240,18 @@ class MeTests(TestCase):
         self.assertEqual(response.data['full_name'], 'Aye Aye')
         user.refresh_from_db()
         self.assertEqual(user.full_name, 'Aye Aye')
+
+    def test_delete_anonymizes_and_deactivates_the_account(self):
+        user = make_user(push_token='ExponentPushToken[delete-me]')
+
+        response = api_client(user).delete('/api/me/')
+
+        self.assertEqual(response.status_code, 204)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        self.assertEqual(user.full_name, 'Deleted account')
+        self.assertEqual(user.push_token, '')
+        self.assertFalse(user.has_usable_password())
 
     def test_role_email_and_active_are_not_editable_here(self):
         user = make_user()
@@ -522,4 +534,77 @@ class PushTokenTests(TestCase):
         response = api_client().post('/api/me/push-token/', {'push_token': self.TOKEN}, format='json')
 
         self.assertEqual(response.status_code, 401)
+
+
+class NotificationTests(TestCase):
+    def setUp(self):
+        self.admin = make_user(role=User.Role.ADMIN)
+        self.teacher = make_user(role=User.Role.TEACHER)
+        self.student = make_user(role=User.Role.STUDENT)
+        self.other_student = make_user(role=User.Role.STUDENT)
+
+    def test_admin_role_announcement_is_saved_for_every_student(self):
+        response = api_client(self.admin).post(
+            '/api/notifications/',
+            {
+                'title': 'Campus closed',
+                'body': 'Classes move online tomorrow.',
+                'target_role': 'STUDENT',
+                'requires_acknowledgement': True,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['recipient_count'], 2)
+        self.assertEqual(Notification.objects.count(), 1)
+        self.assertEqual(NotificationRecipient.objects.count(), 2)
+        inbox = api_client(self.student).get('/api/notifications/').data
+        self.assertEqual(inbox['count'], 1)
+        self.assertEqual(inbox['results'][0]['title'], 'Campus closed')
+        self.assertIsNone(inbox['results'][0]['read_at'])
+
+    def test_recipient_can_read_and_acknowledge(self):
+        notification = Notification.objects.create(
+            sender=self.admin, title='Confirm', body='Please acknowledge.',
+            requires_acknowledgement=True,
+        )
+        row = NotificationRecipient.objects.create(
+            notification=notification, recipient=self.student
+        )
+        client = api_client(self.student)
+
+        read = client.post(f'/api/notifications/{row.pk}/mark-read/', {}, format='json')
+        acknowledged = client.post(
+            f'/api/notifications/{row.pk}/acknowledge/', {}, format='json'
+        )
+
+        self.assertEqual(read.status_code, 200, read.data)
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.data)
+        self.assertIsNotNone(acknowledged.data['read_at'])
+        self.assertIsNotNone(acknowledged.data['acknowledged_at'])
+
+    def test_student_cannot_send_and_teacher_cannot_target_a_role(self):
+        body = {'title': 'No', 'body': 'Not allowed', 'target_role': 'STUDENT'}
+
+        student = api_client(self.student).post('/api/notifications/', body, format='json')
+        teacher = api_client(self.teacher).post('/api/notifications/', body, format='json')
+
+        self.assertEqual(student.status_code, 400, student.data)
+        self.assertEqual(teacher.status_code, 400, teacher.data)
+        self.assertEqual(Notification.objects.count(), 0)
+
+    def test_individual_target_does_not_leak_to_another_user(self):
+        response = api_client(self.admin).post(
+            '/api/notifications/',
+            {
+                'title': 'Private', 'body': 'For one user',
+                'recipient_ids': [str(self.student.pk)],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(api_client(self.student).get('/api/notifications/').data['count'], 1)
+        self.assertEqual(api_client(self.other_student).get('/api/notifications/').data['count'], 0)
 

@@ -1,6 +1,9 @@
+from django.db import transaction
 from django.db.models import ProtectedError, Q
-from rest_framework import status, viewsets
+from django.utils import timezone
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -10,6 +13,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenViewBase
 
 from core.exceptions import ConflictError
+from core.notifications import send_push
 from core.views import RepresentationMixin
 from users.authentication import (
     REFRESH_COOKIE,
@@ -17,10 +21,13 @@ from users.authentication import (
     is_web_client,
     set_token_cookies,
 )
-from users.models import User
+from users.models import Notification, NotificationRecipient, User
 from users.permissions import IsAdminRole
 from users.serializers import (
     MeUpdateSerializer,
+    NotificationCreateSerializer,
+    NotificationRecipientSerializer,
+    NotificationSentSerializer,
     PushTokenSerializer,
     UserAdminUpdateSerializer,
     UserCreateSerializer,
@@ -92,6 +99,21 @@ class MeView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(UserRepresentationSerializer(request.user).data)
+
+    def delete(self, request):
+        """Anonymize and deactivate while preserving assessment/audit foreign keys."""
+        user = request.user
+        suffix = str(user.pk)
+        user.full_name = 'Deleted account'
+        user.username = f'deleted-{suffix}'
+        user.email = f'deleted-{suffix}@deleted.invalid'
+        user.push_token = ''
+        user.is_active = False
+        user.set_unusable_password()
+        user.save(update_fields=[
+            'full_name', 'username', 'email', 'push_token', 'is_active', 'password'
+        ])
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class MePushTokenView(APIView):
@@ -250,3 +272,141 @@ class UserViewSet(RepresentationMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(academic_history(student))
+
+
+class NotificationViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.CreateModelMixin,
+    viewsets.GenericViewSet,
+):
+    permission_classes = (IsAuthenticated,)
+    serializer_class = NotificationRecipientSerializer
+
+    def get_queryset(self):
+        queryset = NotificationRecipient.objects.filter(
+            recipient=self.request.user
+        ).select_related('notification__sender')
+        unread = self.request.query_params.get('unread')
+        if unread in {'true', '1'}:
+            queryset = queryset.filter(read_at__isnull=True)
+        return queryset
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return NotificationCreateSerializer
+        if self.action == 'sent':
+            return NotificationSentSerializer
+        return NotificationRecipientSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        recipients = self._resolve_recipients(data)
+        if not recipients.exists():
+            raise ValidationError({'recipients': ['No eligible recipients matched.']})
+
+        with transaction.atomic():
+            notification = Notification.objects.create(
+                sender=request.user,
+                title=data['title'],
+                body=data['body'],
+                requires_acknowledgement=data['requires_acknowledgement'],
+            )
+            NotificationRecipient.objects.bulk_create([
+                NotificationRecipient(notification=notification, recipient=user)
+                for user in recipients
+            ])
+
+        accepted = send_push(
+            list(recipients),
+            notification.title,
+            notification.body,
+            {'type': 'notification', 'notification_id': str(notification.pk)},
+        )
+        notification.delivery_count = accepted
+        notification.save(update_fields=['delivery_count'])
+        return Response(NotificationSentSerializer(notification).data, status=201)
+
+    def _eligible_students(self):
+        return User.objects.filter(
+            role=User.Role.STUDENT,
+            is_active=True,
+            enrollments__module__lecture_plan__lecturer=self.request.user,
+            enrollments__status__in=['ENROLLED', 'COMPLETED'],
+        ).distinct()
+
+    def _resolve_recipients(self, data):
+        user = self.request.user
+        queryset = User.objects.filter(is_active=True).exclude(pk=user.pk)
+        if user.role == User.Role.TEACHER:
+            queryset = self._eligible_students()
+        if data.get('recipient_ids'):
+            return queryset.filter(pk__in=data['recipient_ids'])
+        if data.get('target_role'):
+            role = data['target_role']
+            return queryset if role == 'ALL' else queryset.filter(role=role)
+        module_id = data['module_id']
+        if user.role == User.Role.TEACHER:
+            queryset = queryset.filter(
+                enrollments__module_id=module_id,
+                enrollments__status__in=['ENROLLED', 'COMPLETED'],
+            )
+        else:
+            queryset = queryset.filter(
+                role=User.Role.STUDENT,
+                enrollments__module_id=module_id,
+                enrollments__status__in=['ENROLLED', 'COMPLETED'],
+            )
+        return queryset.distinct()
+
+    @action(detail=False, methods=['get'])
+    def sent(self, request):
+        if request.user.role == User.Role.STUDENT:
+            return Response(
+                {'code': 'permission_denied', 'detail': 'Students cannot send notifications.'},
+                status=403,
+            )
+        queryset = Notification.objects.filter(sender=request.user).prefetch_related(
+            'recipient_rows'
+        )
+        page = self.paginate_queryset(queryset)
+        serializer = NotificationSentSerializer(page or queryset, many=True)
+        return self.get_paginated_response(serializer.data) if page is not None else Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='eligible-recipients')
+    def eligible_recipients(self, request):
+        if request.user.role == User.Role.STUDENT:
+            return Response([], status=200)
+        queryset = (
+            User.objects.filter(is_active=True).exclude(pk=request.user.pk)
+            if request.user.role == User.Role.ADMIN
+            else self._eligible_students()
+        )
+        search = request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(
+                Q(full_name__icontains=search) | Q(email__icontains=search)
+            )
+        data = UserRepresentationSerializer(queryset.order_by('full_name')[:200], many=True).data
+        return Response(data)
+
+    @action(detail=True, methods=['post'], url_path='mark-read')
+    def mark_read(self, request, pk=None):
+        row = self.get_object()
+        if row.read_at is None:
+            row.read_at = timezone.now()
+            row.save(update_fields=['read_at'])
+        return Response(NotificationRecipientSerializer(row).data)
+
+    @action(detail=True, methods=['post'])
+    def acknowledge(self, request, pk=None):
+        row = self.get_object()
+        if not row.notification.requires_acknowledgement:
+            raise ValidationError({'notification': ['This notification does not require acknowledgement.']})
+        now = timezone.now()
+        row.read_at = row.read_at or now
+        row.acknowledged_at = row.acknowledged_at or now
+        row.save(update_fields=['read_at', 'acknowledged_at'])
+        return Response(NotificationRecipientSerializer(row).data)
