@@ -195,6 +195,7 @@ Admin only, except `GET /api/me/`.
 | `GET` | `/api/users/{id}/` |  |
 | `PATCH` | `/api/users/{id}/` | Admin may change `full_name`, `role`, `is_active`, `email`, `username`. |
 | `DELETE` | `/api/users/{id}/` | `409` if the user teaches a plan, is enrolled, or has graded a result. Deactivate with `is_active: false` instead. |
+| `GET` | `/api/users/{id}/academic-history/` | Admin-only student result history grouped by academic year, semester, and module. |
 
 Create body:
 
@@ -209,6 +210,45 @@ Create body:
 ```
 
 `role` is `ADMIN`, `TEACHER`, or `STUDENT`. Password rules are Django's validators. `409` on duplicate email or username.
+
+`GET /api/me/academic-history/` exposes the same grouped result history to the signed-in student only.
+
+## Majors and student semester placements
+
+`/api/majors/` is an admin-managed CRUD resource (`GET` is readable by every authenticated role). A major has `code`, `name`, `duration_years` (`4` or `5`), and `is_active`; deactivate historical majors rather than deleting referenced rows.
+
+`/api/student-placements/` is admin-only. Each row stores `student_id`, `semester_id`, `major_id`, `study_year`, `admitted_on`, and `is_current`. `study_year` must fit the major duration. Creating a current row makes the student's previous placement historical. Filters include `student_id`, `semester_id`, `academic_id`, `major_id`, `study_year`, and `is_current`.
+
+`POST /api/student-placements/promote/` batch-promotes selected students while preserving their prior rows:
+
+```json
+{
+  "student_ids": ["<uuid>", "<uuid>"],
+  "target_semester_id": "<uuid>",
+  "target_study_year": 2,
+  "major_id": "<optional-major-override>"
+}
+```
+
+Without `major_id`, each student's current major and original admission date carry forward.
+
+## Academic setup drafts
+
+`/api/academic-setup-drafts/` is admin-only CRUD for a resumable four-step setup. A draft stores `name`, `current_step` (1–4), and arbitrary `data` JSON without creating live academic records. Published drafts are immutable.
+
+`POST /api/academic-setup-drafts/{id}/publish/` validates the complete draft, then creates the current academic year, exactly Semester 1 and Semester 2, the majors, and all module placements in one database transaction. Any invalid row creates nothing. The final data shape is:
+
+```json
+{
+  "academic": {"academic_year": "2027-2028", "start_date": "2027-11-01", "end_date": "2028-09-30"},
+  "semesters": [
+    {"semester_no": 1, "semester_name": "Semester 1", "start_date": "2027-11-01", "end_date": "2028-03-31"},
+    {"semester_no": 2, "semester_name": "Semester 2", "start_date": "2028-04-01", "end_date": "2028-09-30"}
+  ],
+  "majors": [{"code": "CS", "name": "Computer Science", "duration_years": 4}],
+  "modules": [{"module_code": "CS101", "module_name": "Programming", "study_year": 1, "semester_no": 1, "major_codes": ["CS"]}]
+}
+```
 
 ## Academics
 
@@ -291,23 +331,29 @@ Response:
 | `GET` | `/api/modules/{id}/` | yes | yes | enrolled only |
 | `PATCH` | `/api/modules/{id}/` | yes | no | no |
 | `DELETE` | `/api/modules/{id}/` | yes | no | no |
+| `POST` | `/api/modules/{id}/copy/` | yes | no | no |
+| `GET` | `/api/modules/{id}/eligible-students/` | yes | no | no |
 
-Filters: `semester_id`, `academic_id`, `lecturer_id`, `search` on `module_code` and `module_name`, `current_year` (boolean, keeps modules whose semester belongs to the current academic year), and `planned` (boolean, whether a lecture plan already exists).
+Filters: `semester_id`, `academic_id`, `lecturer_id`, `major_id`, `study_year`, `search` on `module_code` and `module_name`, `current_year` (boolean, keeps modules whose semester belongs to the current academic year), and `planned` (boolean, whether a lecture plan already exists).
 
 ```json
 {
   "semester_id": "<uuid>",
+  "study_year": 1,
   "module_code": "CS101",
   "module_name": "Programming Fundamentals",
-  "credit_hours": 3
+  "eligible_major_ids": ["<major-uuid>"]
 }
 ```
 
 Rules:
 
-- Unique `(semester_id, module_code)`.
-- `credit_hours` is an integer from 1 to 30.
+- Unique `(semester_id, study_year, module_code)`.
 - Delete returns `409` when a lecture plan or enrollment exists.
+- Module offerings outside the current academic year are read-only and cannot be deleted.
+- An empty `eligible_major_ids` list means the offering is available to every major in that semester.
+- Copy accepts `target_semester_id`, requires the target academic year to be current, and copies only module details and eligible majors. It never copies the teacher, assessment plan, enrollments, or marks.
+- `eligible-students` returns current students whose placement matches the module semester, study year, and eligible majors, excluding students already enrolled.
 
 Response includes `id`, `semester_id`, `academic_id`, and `academic_year`, plus `lecture_plan`, which names the teacher the module was offered to:
 
@@ -317,9 +363,9 @@ Response includes `id`, `semester_id`, `academic_id`, and `academic_year`, plus 
   "semester_id": "<uuid>",
   "academic_id": "<uuid>",
   "academic_year": "2026-2027",
+  "study_year": 1,
   "module_code": "CS101",
   "module_name": "Programming Fundamentals",
-  "credit_hours": 3,
   "lecture_plan": {
     "id": "<uuid>",
     "status": "DRAFT",
@@ -396,8 +442,7 @@ Response:
   "module": {
     "id": "<uuid>",
     "module_code": "CS101",
-    "module_name": "Programming Fundamentals",
-    "credit_hours": 3
+    "module_name": "Programming Fundamentals"
   },
   "semester": { "id": "<uuid>", "semester_no": 1, "semester_name": "First Semester" },
   "lecturer": {
@@ -552,6 +597,7 @@ Filters: `module_id`, `student_id`, `academic_id`, `status`.
 Rules:
 
 - `student_id` is a user with role `STUDENT`.
+- The student must have a current placement in the module's semester and, when configured, an eligible major.
 - Unique `(student_id, module_id)`. A repeat create returns `409`.
 - Server sets `status` to `ENROLLED` and `enrolled_at` to the current time.
 - `PATCH` status may be `ENROLLED`, `DROPPED`, or `COMPLETED`.

@@ -20,7 +20,7 @@ def ensure_draft(plan):
 class PlanModuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Module
-        fields = ('id', 'module_code', 'module_name', 'credit_hours')
+        fields = ('id', 'module_code', 'module_name', 'study_year')
         read_only_fields = fields
 
 

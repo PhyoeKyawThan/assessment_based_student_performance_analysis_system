@@ -1,5 +1,6 @@
 from django.db.models import ProtectedError, Q
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -109,6 +110,91 @@ class MePushTokenView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def academic_history(student):
+    """Stable nested result history grouped by the offering's academic year and semester."""
+    enrollments = student.enrollments.select_related(
+        'module__semester__academic',
+        'module__lecture_plan__lecturer',
+    ).prefetch_related(
+        'results__assessment__distribution',
+        'results__graded_by',
+    ).order_by(
+        '-module__semester__academic__start_date',
+        '-module__semester__semester_no',
+        'module__module_code',
+    )
+    years = {}
+    for enrollment in enrollments:
+        module = enrollment.module
+        semester = module.semester
+        academic = semester.academic
+        year = years.setdefault(str(academic.id), {
+            'academic_id': str(academic.id),
+            'academic_year': academic.academic_year,
+            'semesters': {},
+        })
+        term = year['semesters'].setdefault(str(semester.id), {
+            'semester_id': str(semester.id),
+            'semester_no': semester.semester_no,
+            'semester_name': semester.semester_name,
+            'modules': [],
+        })
+        results = []
+        obtained_total = 0
+        maximum_total = 0
+        for result in sorted(
+            enrollment.results.all(),
+            key=lambda row: (
+                row.assessment.distribution.display_order,
+                row.assessment.sequence_no,
+            ),
+        ):
+            obtained_total += result.marks_obtained
+            maximum_total += result.assessment.max_mark
+            results.append({
+                'id': str(result.id),
+                'assessment_id': str(result.assessment_id),
+                'assessment_type': result.assessment.distribution.assessment_type,
+                'title': result.assessment.title,
+                'sequence_no': result.assessment.sequence_no,
+                'marks_obtained': f'{result.marks_obtained:.2f}',
+                'max_mark': f'{result.assessment.max_mark:.2f}',
+                'remark': result.remark,
+                'graded_at': result.graded_at.isoformat(),
+                'graded_by': result.graded_by.full_name,
+            })
+        plan = getattr(module, 'lecture_plan', None)
+        term['modules'].append({
+            'enrollment_id': str(enrollment.id),
+            'module_id': str(module.id),
+            'module_code': module.module_code,
+            'module_name': module.module_name,
+            'study_year': module.study_year,
+            'status': enrollment.status,
+            'teacher': plan.lecturer.full_name if plan is not None else None,
+            'obtained_total': f'{obtained_total:.2f}',
+            'maximum_total': f'{maximum_total:.2f}',
+            'results': results,
+        })
+    return {
+        'student': UserRepresentationSerializer(student).data,
+        'academic_years': [
+            {**year, 'semesters': list(year['semesters'].values())}
+            for year in years.values()
+        ],
+    }
+
+
+class MyAcademicHistoryView(APIView):
+    def get(self, request):
+        if request.user.role != User.Role.STUDENT:
+            return Response(
+                {'code': 'permission_denied', 'detail': 'Only students have an academic history.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return Response(academic_history(request.user))
+
+
 class UserViewSet(RepresentationMixin, viewsets.ModelViewSet):
     permission_classes = (IsAdminRole,)
     queryset = User.objects.all()
@@ -154,3 +240,13 @@ class UserViewSet(RepresentationMixin, viewsets.ModelViewSet):
             instance.delete()
         except ProtectedError as exc:
             raise ConflictError(str(exc))
+
+    @action(detail=True, methods=['get'], url_path='academic-history')
+    def academic_history(self, request, pk=None):
+        student = self.get_object()
+        if student.role != User.Role.STUDENT:
+            return Response(
+                {'code': 'validation_error', 'detail': 'This user is not a student.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(academic_history(student))

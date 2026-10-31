@@ -1,6 +1,14 @@
 from django.test import TestCase
 
-from catalog.models import Academic, Enrollment, Module, Semester
+from catalog.models import (
+    Academic,
+    AcademicSetupDraft,
+    Enrollment,
+    Major,
+    Module,
+    Semester,
+    StudentPlacement,
+)
 from core.testing import api_client, make_user
 from teaching.models import LecturePlan
 from users.models import User
@@ -35,7 +43,6 @@ class CatalogFixtureMixin:
             **{
                 'module_code': 'CS101',
                 'module_name': 'Programming Fundamentals',
-                'credit_hours': 3,
                 **overrides,
             },
         )
@@ -201,7 +208,6 @@ class ModuleTests(AdminOnlyClientMixin, CatalogFixtureMixin, TestCase):
             'semester_id': str(self.semester.pk),
             'module_code': 'CS101',
             'module_name': 'Programming Fundamentals',
-            'credit_hours': 3,
             **overrides,
         }
         return self.client.post('/api/modules/', payload, format='json')
@@ -219,12 +225,6 @@ class ModuleTests(AdminOnlyClientMixin, CatalogFixtureMixin, TestCase):
         response = self.create()
 
         self.assertEqual(response.status_code, 409, response.data)
-
-    def test_credit_hours_bounds(self):
-        for hours in (0, 31):
-            response = self.create(credit_hours=hours)
-            self.assertEqual(response.status_code, 400, response.data)
-            self.assertIn('credit_hours', response.data['fields'])
 
     def test_student_only_sees_enrolled_modules(self):
         enrolled = self.make_module(self.semester, module_code='CS101')
@@ -331,6 +331,15 @@ class EnrollmentTests(AdminOnlyClientMixin, CatalogFixtureMixin, TestCase):
         super().setUp()
         self.module = self.make_module()
         self.second_student = make_user(role=User.Role.STUDENT)
+        self.major = Major.objects.create(code='CS', name='Computer Science')
+        for student in (self.student, self.second_student):
+            StudentPlacement.objects.create(
+                student=student,
+                semester=self.module.semester,
+                major=self.major,
+                admitted_on='2026-12-01',
+                is_current=True,
+            )
 
     def create(self, student=None, module=None):
         return self.client.post(
@@ -478,3 +487,227 @@ class EnrollmentTests(AdminOnlyClientMixin, CatalogFixtureMixin, TestCase):
 
         self.assertEqual(response.status_code, 409, response.data)
         self.assertTrue(User.objects.filter(pk=self.student.pk).exists())
+
+
+class AcademicWorkflowTests(AdminOnlyClientMixin, CatalogFixtureMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.current = self.make_academic()
+        self.current_semester = self.make_semester(self.current)
+        self.past = self.make_academic(
+            academic_year='2025-2026',
+            start_date='2025-12-01',
+            end_date='2026-09-30',
+            is_current=False,
+        )
+        self.past_semester = self.make_semester(self.past)
+        self.cs = Major.objects.create(code='CS', name='Computer Science')
+        self.is_major = Major.objects.create(code='IS', name='Information Systems')
+
+    def test_copy_historical_module_copies_placement_and_majors_only(self):
+        source = self.make_module(self.past_semester)
+        source.eligible_majors.add(self.cs)
+        LecturePlan.objects.create(
+            module=source, lecturer=self.teacher, academic=self.past
+        )
+
+        response = self.client.post(
+            f'/api/modules/{source.pk}/copy/',
+            {'target_semester_id': str(self.current_semester.pk)},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        copied = Module.objects.get(pk=response.data['id'])
+        self.assertEqual(copied.semester, self.current_semester)
+        self.assertEqual(copied.module_code, source.module_code)
+        self.assertEqual(list(copied.eligible_majors.all()), [self.cs])
+        self.assertFalse(hasattr(copied, 'lecture_plan'))
+
+    def test_copy_rejects_a_non_current_target(self):
+        source = self.make_module(self.current_semester)
+
+        response = self.client.post(
+            f'/api/modules/{source.pk}/copy/',
+            {'target_semester_id': str(self.past_semester.pk)},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn('target_semester_id', response.data['fields'])
+
+    def test_historical_module_is_read_only(self):
+        historical = self.make_module(self.past_semester)
+
+        patch_response = self.client.patch(
+            f'/api/modules/{historical.pk}/', {'module_name': 'Changed'}, format='json'
+        )
+        delete_response = self.client.delete(f'/api/modules/{historical.pk}/')
+
+        self.assertEqual(patch_response.status_code, 409, patch_response.data)
+        self.assertEqual(delete_response.status_code, 409, delete_response.data)
+        historical.refresh_from_db()
+        self.assertEqual(historical.module_name, 'Programming Fundamentals')
+
+    def test_eligible_students_match_semester_and_major(self):
+        module = self.make_module(self.current_semester)
+        module.eligible_majors.add(self.cs)
+        eligible = self.student
+        wrong_major = make_user(role=User.Role.STUDENT)
+        no_placement = make_user(role=User.Role.STUDENT)
+        StudentPlacement.objects.create(
+            student=eligible, semester=self.current_semester, major=self.cs,
+            admitted_on='2026-12-01', is_current=True,
+        )
+        StudentPlacement.objects.create(
+            student=wrong_major, semester=self.current_semester, major=self.is_major,
+            admitted_on='2026-12-01', is_current=True,
+        )
+
+        rows = self.client.get(
+            f'/api/modules/{module.pk}/eligible-students/'
+        ).data['results']
+
+        self.assertEqual([row['id'] for row in rows], [str(eligible.pk)])
+        for student in (wrong_major, no_placement):
+            response = self.client.post(
+                '/api/enrollments/',
+                {'student_id': str(student.pk), 'module_id': str(module.pk)},
+                format='json',
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+
+    def test_batch_promotion_preserves_the_previous_placement(self):
+        source = StudentPlacement.objects.create(
+            student=self.student,
+            semester=self.past_semester,
+            major=self.cs,
+            admitted_on='2025-12-01',
+            is_current=True,
+        )
+
+        response = self.client.post(
+            '/api/student-placements/promote/',
+            {
+                'student_ids': [str(self.student.pk)],
+                'target_semester_id': str(self.current_semester.pk),
+                'target_study_year': 2,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        source.refresh_from_db()
+        self.assertFalse(source.is_current)
+        promoted = StudentPlacement.objects.get(
+            student=self.student, semester=self.current_semester
+        )
+        self.assertTrue(promoted.is_current)
+        self.assertEqual(promoted.major, self.cs)
+        self.assertEqual(promoted.study_year, 2)
+        self.assertEqual(str(promoted.admitted_on), '2025-12-01')
+
+
+class AcademicSetupDraftTests(AdminOnlyClientMixin, TestCase):
+    def payload(self):
+        return {
+            'academic': {
+                'academic_year': '2027-2028',
+                'start_date': '2027-11-01',
+                'end_date': '2028-09-30',
+            },
+            'semesters': [
+                {
+                    'semester_no': 1,
+                    'semester_name': 'Semester 1',
+                    'start_date': '2027-11-01',
+                    'end_date': '2028-03-31',
+                },
+                {
+                    'semester_no': 2,
+                    'semester_name': 'Semester 2',
+                    'start_date': '2028-04-01',
+                    'end_date': '2028-09-30',
+                },
+            ],
+            'majors': [
+                {'code': 'CS', 'name': 'Computer Science', 'duration_years': 4},
+                {'code': 'ARCH', 'name': 'Architecture', 'duration_years': 5},
+            ],
+            'modules': [
+                {
+                    'module_code': 'CS101',
+                    'module_name': 'Programming',
+                    'study_year': 1,
+                    'semester_no': 1,
+                    'major_codes': ['CS'],
+                },
+                {
+                    'module_code': 'AR501',
+                    'module_name': 'Architecture Studio',
+                    'study_year': 5,
+                    'semester_no': 2,
+                    'major_codes': ['ARCH'],
+                },
+            ],
+        }
+
+    def create_draft(self, data=None):
+        response = self.client.post(
+            '/api/academic-setup-drafts/',
+            {'name': 'Next year', 'current_step': 1, 'data': data or self.payload()},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        return response
+
+    def test_draft_can_be_saved_without_creating_live_records(self):
+        response = self.create_draft({'academic': {'academic_year': '2027-2028'}})
+
+        self.assertEqual(Academic.objects.count(), 0)
+        updated = self.client.patch(
+            f'/api/academic-setup-drafts/{response.data["id"]}/',
+            {'current_step': 2, 'data': self.payload()},
+            format='json',
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(updated.data['current_step'], 2)
+        self.assertEqual(Academic.objects.count(), 0)
+
+    def test_publish_creates_the_complete_setup_atomically(self):
+        old = Academic.objects.create(
+            academic_year='2026-2027', start_date='2026-11-01',
+            end_date='2027-09-30', is_current=True,
+        )
+        draft = self.create_draft()
+
+        response = self.client.post(
+            f'/api/academic-setup-drafts/{draft.data["id"]}/publish/', {}, format='json'
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        academic = Academic.objects.get(academic_year='2027-2028')
+        old.refresh_from_db()
+        self.assertTrue(academic.is_current)
+        self.assertFalse(old.is_current)
+        self.assertEqual(academic.semesters.count(), 2)
+        self.assertEqual(Major.objects.get(code='ARCH').duration_years, 5)
+        self.assertEqual(Module.objects.get(module_code='AR501').study_year, 5)
+        self.assertEqual(
+            AcademicSetupDraft.objects.get(pk=draft.data['id']).status,
+            AcademicSetupDraft.Status.PUBLISHED,
+        )
+
+    def test_invalid_publish_creates_nothing(self):
+        data = self.payload()
+        data['modules'][1]['major_codes'] = ['CS']
+        draft = self.create_draft(data)
+
+        response = self.client.post(
+            f'/api/academic-setup-drafts/{draft.data["id"]}/publish/', {}, format='json'
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(Academic.objects.count(), 0)
+        self.assertEqual(Semester.objects.count(), 0)
+        self.assertEqual(Module.objects.count(), 0)

@@ -182,7 +182,7 @@ def admin_dashboard():
                 'id': str(module.pk),
                 'module_code': module.module_code,
                 'module_name': module.module_name,
-                'credit_hours': module.credit_hours,
+                'study_year': module.study_year,
                 'semester': f'Semester {module.semester.semester_no}',
                 'academic_year': module.semester.academic.academic_year,
             }

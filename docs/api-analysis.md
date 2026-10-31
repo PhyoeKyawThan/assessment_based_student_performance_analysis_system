@@ -66,14 +66,11 @@ Query: `academic_id` optional. Without it, every snapshot for that student is re
     {
       "academic_id": "<uuid>",
       "academic_year": "2026-2027",
-      "gpa": "3.25",
-      "total_credit_hours": 12,
       "modules": [
         {
           "module_id": "<uuid>",
           "module_code": "CS101",
           "module_name": "Programming Fundamentals",
-          "credit_hours": 3,
           "enrollment_status": "COMPLETED",
           "obtained_percentage": "76.50",
           "coverage_percentage": "100.00",
@@ -96,15 +93,7 @@ Query: `academic_id` optional. Without it, every snapshot for that student is re
 }
 ```
 
-GPA uses modules in that year whose enrollment is `COMPLETED` and whose `coverage_percentage` is `100.00`.
-
-```text
-gpa = sum(grade_point * credit_hours) / sum(credit_hours)
-```
-
-Rounded to two decimal places, half up. If no module qualifies, `gpa` is `null` and `total_credit_hours` is `0`.
-
-`rank` is 1-based among `ENROLLED` and `COMPLETED` students in the same module who have a snapshot, ordered by `obtained_percentage` descending. Ties share the same rank, and the next rank skips (1, 2, 2, 4). A teacher calling this route only receives modules they teach. `gpa` for a teacher is omitted (`null`) because it would mix hidden modules. Admin and the student receive the full GPA.
+`rank` is 1-based among `ENROLLED` and `COMPLETED` students in the same module who have a snapshot, ordered by `obtained_percentage` descending. Ties share the same rank, and the next rank skips (1, 2, 2, 4). A teacher calling this route only receives modules they teach.
 
 ## `GET /api/analysis/modules/{module_id}/`
 
@@ -116,7 +105,6 @@ Cohort for one module. Students with no snapshot are counted in `unenrolled_mark
     "id": "<uuid>",
     "module_code": "CS101",
     "module_name": "Programming Fundamentals",
-    "credit_hours": 3,
     "academic_year": "2026-2027"
   },
   "cohort_size": 40,

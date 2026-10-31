@@ -373,6 +373,25 @@ class ResultReadTests(MarkingTestCase):
                 continue
             self.assertEqual(response.data['count'], expected, query)
 
+    def test_student_history_groups_marks_by_academic_semester_and_module(self):
+        response = api_client(self.student).get('/api/me/academic-history/')
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['student']['id'], str(self.student.pk))
+        year = response.data['academic_years'][0]
+        semester = year['semesters'][0]
+        module = semester['modules'][0]
+        self.assertEqual(module['module_code'], self.plan.module.module_code)
+        self.assertEqual(module['obtained_total'], '8.00')
+        self.assertEqual(module['maximum_total'], '10.00')
+        self.assertEqual(module['results'][0]['title'], self.quiz_one.title)
+
+    def test_admin_can_read_a_student_history(self):
+        response = self.client.get(f'/api/users/{self.student.pk}/academic-history/')
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['student']['id'], str(self.student.pk))
+
 
 class GradingCompletionTests(MarkingTestCase):
     def test_mark_graded_refuses_a_missing_mark(self):
