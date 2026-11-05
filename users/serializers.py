@@ -161,7 +161,8 @@ class NotificationCreateSerializer(serializers.Serializer):
         child=serializers.UUIDField(), required=False, allow_empty=False
     )
     target_role = serializers.ChoiceField(
-        choices=('ALL', User.Role.TEACHER, User.Role.STUDENT), required=False
+        choices=('ALL', User.Role.STUDENT_AFFAIRS, User.Role.TEACHER, User.Role.STUDENT),
+        required=False,
     )
     module_id = serializers.UUIDField(required=False)
 

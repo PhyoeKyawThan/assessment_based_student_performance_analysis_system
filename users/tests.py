@@ -1,7 +1,85 @@
+from io import BytesIO
+
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
+from openpyxl import Workbook
 
 from core.testing import PASSWORD, api_client, make_user
 from users.models import Notification, NotificationRecipient, User
+
+
+def user_workbook(rows, headers=('username', 'email', 'full_name', 'role', 'password')):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(headers)
+    for row in rows:
+        sheet.append(row)
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return SimpleUploadedFile(
+        'users.xlsx', output.getvalue(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+
+
+class UserXlsxImportTests(TestCase):
+    def setUp(self):
+        self.admin = make_user(role=User.Role.ADMIN)
+        self.client = api_client(self.admin)
+
+    def test_preview_finds_database_and_workbook_duplicates_without_writing(self):
+        make_user(username='existing', email='existing@university.edu')
+        upload = user_workbook([
+            ('existing', 'new1@university.edu', 'Existing Username', 'STUDENT', PASSWORD),
+            ('new.teacher', 'teacher@university.edu', 'New Teacher', 'LECTURER', PASSWORD),
+            ('new.teacher', 'another@university.edu', 'Repeated', 'TEACHER', PASSWORD),
+            ('bad.role', 'bad@university.edu', 'Bad Role', 'ADMIN', PASSWORD),
+        ])
+
+        response = self.client.post(
+            '/api/users/import-preview/', {'file': upload}, format='multipart'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['summary'], {
+            'total': 4, 'ready': 1, 'duplicates': 2, 'invalid': 1,
+        })
+        self.assertFalse(User.objects.filter(username='new.teacher').exists())
+
+    def test_commit_imports_valid_rows_and_skips_existing_identities(self):
+        make_user(username='existing', email='existing@university.edu')
+        upload = user_workbook([
+            ('student.001', 'student.001@university.edu', 'Student One', 'STUDENT', PASSWORD),
+            ('teacher.001', 'teacher.001@university.edu', 'Teacher One', 'TEACHER', PASSWORD),
+            ('existing', 'other@university.edu', 'Existing', 'STUDENT', PASSWORD),
+        ])
+
+        response = self.client.post(
+            '/api/users/import-commit/', {'file': upload}, format='multipart'
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['created_count'], 2)
+        self.assertEqual(response.data['skipped_count'], 1)
+        student = User.objects.get(username='student.001')
+        teacher = User.objects.get(username='teacher.001')
+        self.assertEqual(student.role, User.Role.STUDENT)
+        self.assertEqual(teacher.role, User.Role.TEACHER)
+        self.assertTrue(student.check_password(PASSWORD))
+
+    def test_commit_is_blocked_when_any_row_is_invalid(self):
+        upload = user_workbook([
+            ('valid.001', 'valid.001@university.edu', 'Valid User', 'STUDENT', PASSWORD),
+            ('admin.001', 'admin.001@university.edu', 'Admin User', 'ADMIN', PASSWORD),
+        ])
+
+        response = self.client.post(
+            '/api/users/import-commit/', {'file': upload}, format='multipart'
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertFalse(User.objects.filter(username='valid.001').exists())
 
 
 class LoginTests(TestCase):

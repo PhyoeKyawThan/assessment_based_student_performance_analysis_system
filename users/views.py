@@ -1,4 +1,4 @@
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError, Q
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
@@ -22,6 +22,9 @@ from users.authentication import (
     set_token_cookies,
 )
 from users.models import Notification, NotificationRecipient, User
+from users.imports import (
+    UserImportError, import_summary, parse_user_workbook, validate_user_rows,
+)
 from users.permissions import IsAdminRole
 from users.serializers import (
     MeUpdateSerializer,
@@ -140,6 +143,7 @@ def academic_history(student):
     ).prefetch_related(
         'results__assessment__distribution',
         'results__graded_by',
+        'period_results__sheet',
     ).order_by(
         '-module__semester__academic__start_date',
         '-module__semester__semester_no',
@@ -186,6 +190,13 @@ def academic_history(student):
                 'graded_by': result.graded_by.full_name,
             })
         plan = getattr(module, 'lecture_plan', None)
+        official_result = next(
+            (
+                row for row in enrollment.period_results.all()
+                if row.sheet.status == 'LOCKED'
+            ),
+            None,
+        )
         term['modules'].append({
             'enrollment_id': str(enrollment.id),
             'module_id': str(module.id),
@@ -196,6 +207,14 @@ def academic_history(student):
             'teacher': plan.lecturer.full_name if plan is not None else None,
             'obtained_total': f'{obtained_total:.2f}',
             'maximum_total': f'{maximum_total:.2f}',
+            'official_raw_mark': (
+                f'{official_result.raw_mark:.2f}' if official_result is not None else None
+            ),
+            'official_result_locked_at': (
+                official_result.sheet.locked_at.isoformat()
+                if official_result is not None and official_result.sheet.locked_at is not None
+                else None
+            ),
             'results': results,
         })
     return {
@@ -242,6 +261,12 @@ class UserViewSet(RepresentationMixin, viewsets.ModelViewSet):
         if is_active is not None and is_active != '':
             queryset = queryset.filter(is_active=is_active.lower() in {'true', '1'})
 
+        placement_status = params.get('placement_status')
+        if placement_status == 'unplaced':
+            queryset = queryset.exclude(placements__is_current=True)
+        elif placement_status == 'placed':
+            queryset = queryset.filter(placements__is_current=True).distinct()
+
         search = params.get('search')
         if search:
             queryset = queryset.filter(
@@ -262,6 +287,58 @@ class UserViewSet(RepresentationMixin, viewsets.ModelViewSet):
             instance.delete()
         except ProtectedError as exc:
             raise ConflictError(str(exc))
+
+    def _read_import(self, request):
+        upload = request.FILES.get('file')
+        if upload is None:
+            raise ValidationError({'file': ['Attach an XLSX workbook.']})
+        try:
+            return validate_user_rows(parse_user_workbook(upload))
+        except UserImportError as exc:
+            raise ValidationError({'file': [str(exc)]})
+
+    @action(detail=False, methods=['post'], url_path='import-preview')
+    def import_preview(self, request):
+        rows = self._read_import(request)
+        issues = [row.public() for row in rows if row.status != 'READY'][:200]
+        sample = [row.public() for row in rows if row.status == 'READY'][:20]
+        return Response({
+            'summary': import_summary(rows),
+            'issues': issues,
+            'sample': sample,
+            'issues_truncated': sum(row.status != 'READY' for row in rows) > len(issues),
+        })
+
+    @action(detail=False, methods=['post'], url_path='import-commit')
+    def import_commit(self, request):
+        rows = self._read_import(request)
+        summary = import_summary(rows)
+        if summary['invalid']:
+            raise ValidationError({
+                'file': ['Correct every invalid row before importing. Preview the workbook for details.']
+            })
+
+        created = 0
+        for row in rows:
+            if row.status != 'READY':
+                continue
+            try:
+                with transaction.atomic():
+                    user = User(**row.data)
+                    user.set_password(row.data['password'])
+                    user.save()
+                    created += 1
+            except IntegrityError:
+                # A concurrent import may have created this identity after preview.
+                row.status = 'DUPLICATE'
+                row.message = 'Username or email was created by another request.'
+
+        return Response({
+            'created_count': created,
+            'skipped_count': sum(row.status == 'DUPLICATE' for row in rows),
+            'summary': import_summary(rows),
+            'duplicates': [row.public() for row in rows if row.status == 'DUPLICATE'][:200],
+        }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'], url_path='academic-history')
     def academic_history(self, request, pk=None):
@@ -381,7 +458,7 @@ class NotificationViewSet(
             return Response([], status=200)
         queryset = (
             User.objects.filter(is_active=True).exclude(pk=request.user.pk)
-            if request.user.role == User.Role.ADMIN
+            if request.user.role in (User.Role.ADMIN, User.Role.STUDENT_AFFAIRS)
             else self._eligible_students()
         )
         search = request.query_params.get('search')

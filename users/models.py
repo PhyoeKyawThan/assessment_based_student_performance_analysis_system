@@ -5,6 +5,7 @@ import uuid
 class User(AbstractUser):
     class Role(models.TextChoices):
         ADMIN = 'ADMIN', 'Admin'
+        STUDENT_AFFAIRS = 'STUDENT_AFFAIRS', 'Student Affairs'
         TEACHER = 'TEACHER', 'Teacher'
         STUDENT = 'STUDENT', 'Student'
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

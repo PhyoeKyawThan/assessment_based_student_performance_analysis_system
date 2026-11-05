@@ -24,7 +24,7 @@ from users.permissions import IsLecturerRole
 
 def readable_plan_filter(prefix, user):
     """Limit a lecture-plan-rooted queryset to the rows this role may read."""
-    if is_admin(user):
+    if is_admin(user) or user.role == User.Role.STUDENT_AFFAIRS:
         return Q()
     if user.role == User.Role.TEACHER:
         return Q(**{f'{prefix}lecturer': user})
@@ -46,6 +46,11 @@ class LecturePlanViewSet(RepresentationMixin, viewsets.ModelViewSet):
     serializer_class = LecturePlanSerializer
     representation_serializer_class = LecturePlanSerializer
     permission_classes = (IsPlanWriter,)
+
+    def perform_create(self, serializer):
+        plan = serializer.save()
+        from marking.models import ModuleResultSheet
+        ModuleResultSheet.objects.get_or_create(lecture_plan=plan)
 
     def get_queryset(self):
         queryset = super().get_queryset().filter(readable_plan_filter('', self.request.user))
@@ -70,6 +75,8 @@ class LecturePlanViewSet(RepresentationMixin, viewsets.ModelViewSet):
         if instance.status != LecturePlan.Status.DRAFT:
             raise ConflictError('Only a DRAFT lecture plan can be deleted.')
         with atomic():
+            from marking.models import ModuleResultSheet
+            ModuleResultSheet.objects.filter(lecture_plan=instance).delete()
             Assessment.objects.filter(distribution__lecture_plan=instance).delete()
             instance.distributions.all().delete()
             instance.delete()

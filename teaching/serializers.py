@@ -86,12 +86,15 @@ class LecturePlanSerializer(serializers.ModelSerializer):
                 )
 
             academic = module.semester.academic
-            if not academic.is_current:
+            if (
+                module.semester.status != Semester.Status.ACTIVE
+                and not academic.is_current
+            ):
                 raise serializers.ValidationError(
                     {
                         'module_id': [
-                            f'{module.module_code} belongs to academic year '
-                            f'{academic.academic_year}, which is not the current year.'
+                            f'{module.module_code} belongs to a teaching period '
+                            'that is not active.'
                         ]
                     }
                 )

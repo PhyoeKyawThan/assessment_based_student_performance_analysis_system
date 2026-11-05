@@ -9,9 +9,14 @@ from rest_framework.response import Response
 from catalog.models import (
     Academic,
     AcademicSetupDraft,
+    Cohort,
+    CohortTerm,
+    CurriculumModule,
+    CurriculumVersion,
     Enrollment,
     Major,
     Module,
+    ModuleDefinition,
     Semester,
     StudentPlacement,
 )
@@ -19,14 +24,21 @@ from catalog.serializers import (
     AcademicSerializer,
     AcademicSetupDraftSerializer,
     AcademicSetupPublishSerializer,
+    CohortSerializer,
+    CohortTermSerializer,
+    CurriculumModuleSerializer,
+    CurriculumVersionSerializer,
     EnrollmentBulkSerializer,
     EnrollmentSerializer,
     EnrollmentStatusSerializer,
     MajorSerializer,
     ModuleCopySerializer,
+    ModuleDefinitionSerializer,
     ModuleSerializer,
     PlacementPromotionSerializer,
+    PlacementBulkCreateSerializer,
     SemesterSerializer,
+    TeachingPeriodSerializer,
     StudentPlacementSerializer,
     UserBriefSerializer,
 )
@@ -51,12 +63,50 @@ class AcademicViewSet(RepresentationMixin, viewsets.ModelViewSet):
         return queryset
 
     def perform_destroy(self, instance):
-        try:
-            instance.delete()
-        except ProtectedError:
-            raise ConflictError(
-                'Semesters still reference this academic year. Delete them first.'
+        """Delete the complete year graph in dependency order, as one atomic operation."""
+        from marking.models import AssessmentResult, ModulePeriodResult, ModuleResultSheet
+        from teaching.models import Assessment, AssessmentDistribution, LecturePlan
+
+        with atomic():
+            semester_ids = list(instance.semesters.values_list('id', flat=True))
+            module_ids = list(
+                Module.objects.filter(semester_id__in=semester_ids).values_list('id', flat=True)
             )
+            plan_ids = list(
+                LecturePlan.objects.filter(
+                    Q(academic=instance) | Q(module_id__in=module_ids)
+                ).values_list('id', flat=True)
+            )
+            distribution_ids = list(
+                AssessmentDistribution.objects.filter(
+                    lecture_plan_id__in=plan_ids
+                ).values_list('id', flat=True)
+            )
+            assessment_ids = list(
+                Assessment.objects.filter(
+                    distribution_id__in=distribution_ids
+                ).values_list('id', flat=True)
+            )
+            enrollment_ids = list(
+                Enrollment.objects.filter(module_id__in=module_ids).values_list('id', flat=True)
+            )
+
+            AssessmentResult.objects.filter(
+                Q(assessment_id__in=assessment_ids) | Q(enrollment_id__in=enrollment_ids)
+            ).delete()
+            ModulePeriodResult.objects.filter(
+                Q(sheet__lecture_plan_id__in=plan_ids) | Q(enrollment_id__in=enrollment_ids)
+            ).delete()
+            ModuleResultSheet.objects.filter(lecture_plan_id__in=plan_ids).delete()
+            Assessment.objects.filter(id__in=assessment_ids).delete()
+            AssessmentDistribution.objects.filter(id__in=distribution_ids).delete()
+            Enrollment.objects.filter(id__in=enrollment_ids).delete()
+            LecturePlan.objects.filter(id__in=plan_ids).delete()
+            CohortTerm.objects.filter(semester_id__in=semester_ids).delete()
+            StudentPlacement.objects.filter(semester_id__in=semester_ids).delete()
+            Module.objects.filter(id__in=module_ids).delete()
+            Semester.objects.filter(id__in=semester_ids).delete()
+            instance.delete()
 
 
 class SemesterViewSet(RepresentationMixin, viewsets.ModelViewSet):
@@ -71,6 +121,29 @@ class SemesterViewSet(RepresentationMixin, viewsets.ModelViewSet):
         if raw not in (None, ''):
             queryset = queryset.filter(academic=uuid_param('academic_id', raw))
         return queryset
+
+    def perform_destroy(self, instance):
+        try:
+            instance.delete()
+        except ProtectedError:
+            raise ConflictError('Modules still reference this semester. Delete them first.')
+
+
+class TeachingPeriodViewSet(RepresentationMixin, viewsets.ModelViewSet):
+    queryset = Semester.objects.select_related('academic')
+    serializer_class = TeachingPeriodSerializer
+    representation_serializer_class = TeachingPeriodSerializer
+    permission_classes = (IsAdminRoleOrReadOnly,)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        label = self.request.query_params.get('academic_label')
+        if label:
+            queryset = queryset.filter(academic__academic_year=label)
+        status_value = self.request.query_params.get('status')
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        return queryset.order_by('-start_date', 'semester_no')
 
     def perform_destroy(self, instance):
         try:
@@ -104,9 +177,152 @@ class MajorViewSet(RepresentationMixin, viewsets.ModelViewSet):
             )
 
 
+class ModuleDefinitionViewSet(RepresentationMixin, viewsets.ModelViewSet):
+    queryset = ModuleDefinition.objects.all()
+    serializer_class = ModuleDefinitionSerializer
+    representation_serializer_class = ModuleDefinitionSerializer
+    permission_classes = (IsAdminRoleOrReadOnly,)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        raw = self.request.query_params.get('is_active')
+        if raw not in (None, ''):
+            queryset = queryset.filter(is_active=bool_param('is_active', raw))
+        search = self.request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(Q(code__icontains=search) | Q(name__icontains=search))
+        return queryset
+
+    def perform_destroy(self, instance):
+        if instance.offerings.exists() or instance.curriculum_slots.exists():
+            raise ConflictError('This catalogue module is in use. Deactivate it instead.')
+        instance.delete()
+
+
+class CurriculumVersionViewSet(RepresentationMixin, viewsets.ModelViewSet):
+    queryset = CurriculumVersion.objects.select_related(
+        'major', 'effective_from'
+    ).prefetch_related('module_slots__module_definition')
+    serializer_class = CurriculumVersionSerializer
+    representation_serializer_class = CurriculumVersionSerializer
+    permission_classes = (IsAdminRoleOrReadOnly,)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        raw = self.request.query_params.get('major_id')
+        if raw not in (None, ''):
+            queryset = queryset.filter(major=uuid_param('major_id', raw))
+        if self.request.query_params.get('status'):
+            queryset = queryset.filter(status=self.request.query_params['status'])
+        return queryset
+
+    @action(
+        detail=True, methods=['post'], permission_classes=(IsAdminRole,),
+        url_path='generate-offerings',
+    )
+    def generate_offerings(self, request, pk=None):
+        curriculum = self.get_object()
+        teaching_period_id = request.data.get('teaching_period_id')
+        programme_semester = request.data.get('programme_semester')
+        if teaching_period_id not in (None, ''):
+            period_id = uuid_param('teaching_period_id', teaching_period_id)
+            period = Semester.objects.filter(pk=period_id).first()
+            if period is None:
+                raise ValidationError({'teaching_period_id': ['Teaching period not found.']})
+            try:
+                fixed_semester = int(programme_semester)
+            except (TypeError, ValueError):
+                raise ValidationError({'programme_semester': ['Choose Semester 1 to 10.']})
+            if fixed_semester < 1 or fixed_semester > curriculum.major.duration_years * 2:
+                raise ValidationError({'programme_semester': ['Semester exceeds the programme duration.']})
+            expected_period = 1 if fixed_semester % 2 else 2
+            if period.semester_no != expected_period:
+                raise ValidationError({
+                    'teaching_period_id': [
+                        f'Semester {fixed_semester} must be offered in period {expected_period}.'
+                    ]
+                })
+            slots = [
+                slot for slot in curriculum.module_slots.select_related('module_definition')
+                if slot.semester_number == fixed_semester
+            ]
+            created = []
+            with atomic():
+                for slot in slots:
+                    offering, was_created = Module.objects.get_or_create(
+                        semester=period,
+                        study_year=slot.study_year,
+                        module_code=slot.module_definition.code,
+                        defaults={
+                            'definition': slot.module_definition,
+                            'module_name': slot.module_definition.name,
+                        },
+                    )
+                    offering.eligible_majors.add(curriculum.major)
+                    if was_created:
+                        created.append(offering)
+            return Response(ModuleSerializer(created, many=True).data, status=status.HTTP_201_CREATED)
+
+        # Compatibility for clients created before teaching periods became first-class.
+        academic_id = uuid_param('academic_id', request.data.get('academic_id'))
+        academic = Academic.objects.filter(pk=academic_id).first()
+        if academic is None:
+            raise ValidationError({'academic_id': ['Academic session not found.']})
+        terms = {row.semester_no: row for row in academic.semesters.all()}
+        if 1 not in terms or 2 not in terms:
+            raise ValidationError({'academic_id': ['The session needs Term 1 and Term 2 first.']})
+        created = []
+        with atomic():
+            for slot in curriculum.module_slots.select_related('module_definition'):
+                offering, was_created = Module.objects.get_or_create(
+                    semester=terms[slot.term_number],
+                    study_year=slot.study_year,
+                    module_code=slot.module_definition.code,
+                    defaults={
+                        'definition': slot.module_definition,
+                        'module_name': slot.module_definition.name,
+                    },
+                )
+                if was_created:
+                    offering.eligible_majors.add(curriculum.major)
+                    created.append(offering)
+                elif not offering.eligible_majors.filter(pk=curriculum.major_id).exists():
+                    offering.eligible_majors.add(curriculum.major)
+        return Response(ModuleSerializer(created, many=True).data, status=status.HTTP_201_CREATED)
+
+
+class CurriculumModuleViewSet(RepresentationMixin, viewsets.ModelViewSet):
+    queryset = CurriculumModule.objects.select_related(
+        'curriculum__major', 'module_definition'
+    )
+    serializer_class = CurriculumModuleSerializer
+    representation_serializer_class = CurriculumModuleSerializer
+    permission_classes = (IsAdminRoleOrReadOnly,)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        raw = self.request.query_params.get('curriculum_id')
+        if raw not in (None, ''):
+            queryset = queryset.filter(curriculum=uuid_param('curriculum_id', raw))
+        return queryset
+
+class CohortViewSet(RepresentationMixin, viewsets.ModelViewSet):
+    queryset = Cohort.objects.select_related('major', 'curriculum')
+    serializer_class = CohortSerializer
+    representation_serializer_class = CohortSerializer
+    permission_classes = (IsAdminRole,)
+
+
+class CohortTermViewSet(RepresentationMixin, viewsets.ModelViewSet):
+    queryset = CohortTerm.objects.select_related('cohort', 'semester__academic')
+    serializer_class = CohortTermSerializer
+    representation_serializer_class = CohortTermSerializer
+    permission_classes = (IsAdminRole,)
+
+
 class ModuleViewSet(RepresentationMixin, viewsets.ModelViewSet):
     queryset = Module.objects.select_related(
-        'semester__academic', 'lecture_plan__lecturer'
+        'semester__academic', 'definition', 'lecture_plan__lecturer'
     ).prefetch_related('eligible_majors')
     serializer_class = ModuleSerializer
     representation_serializer_class = ModuleSerializer
@@ -167,7 +383,7 @@ class ModuleViewSet(RepresentationMixin, viewsets.ModelViewSet):
         serializer = ModuleCopySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         target = serializer.validated_data['target_semester']
-        if not target.academic.is_current:
+        if target.status != Semester.Status.ACTIVE and not target.academic.is_current:
             raise ValidationError({
                 'target_semester_id': ['Modules may only be copied into the current academic year.']
             })
@@ -181,6 +397,7 @@ class ModuleViewSet(RepresentationMixin, viewsets.ModelViewSet):
         with atomic():
             copied = Module.objects.create(
                 semester=target,
+                definition=source.definition,
                 module_code=source.module_code,
                 module_name=source.module_name,
                 study_year=source.study_year,
@@ -215,7 +432,10 @@ class ModuleViewSet(RepresentationMixin, viewsets.ModelViewSet):
         return self.get_paginated_response(data) if page is not None else Response(data)
 
     def perform_destroy(self, instance):
-        if not instance.semester.academic.is_current:
+        if (
+            instance.semester.status != Semester.Status.ACTIVE
+            and not instance.semester.academic.is_current
+        ):
             raise ConflictError(
                 'Historical module offerings are read-only and cannot be deleted.'
             )
@@ -328,6 +548,63 @@ class StudentPlacementViewSet(RepresentationMixin, viewsets.ModelViewSet):
     representation_serializer_class = StudentPlacementSerializer
     permission_classes = (IsAdminRole,)
 
+    @action(detail=False, methods=['post'], url_path='bulk')
+    def bulk_create(self, request):
+        serializer = PlacementBulkCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        students = User.objects.filter(role=User.Role.STUDENT, is_active=True)
+        if data['all_unplaced']:
+            students = students.filter(placements__is_current=True).distinct()
+            placed_ids = students.values_list('pk', flat=True)
+            students = User.objects.filter(
+                role=User.Role.STUDENT, is_active=True
+            ).exclude(pk__in=placed_ids)
+        else:
+            requested = list(dict.fromkeys(data['student_ids']))
+            students = students.filter(pk__in=requested)
+            found_ids = set(students.values_list('pk', flat=True))
+            missing = [str(pk) for pk in requested if pk not in found_ids]
+            if missing:
+                raise ValidationError({
+                    'student_ids': [f'{pk} is not an active student.' for pk in missing]
+                })
+
+        student_ids = list(students.values_list('pk', flat=True))
+        already_current = set(
+            StudentPlacement.objects.filter(
+                student_id__in=student_ids, is_current=True
+            ).values_list('student_id', flat=True)
+        )
+        study_year = ((data['programme_semester'] - 1) // 2) + 1
+        created = []
+        with atomic():
+            for student_id in student_ids:
+                if student_id in already_current:
+                    continue
+                placement, was_created = StudentPlacement.objects.update_or_create(
+                    student_id=student_id,
+                    semester=data['teaching_period'],
+                    defaults={
+                        'major': data['major'],
+                        'study_year': study_year,
+                        'admitted_on': data['admitted_on'],
+                        'is_current': True,
+                    },
+                )
+                if was_created:
+                    created.append(placement)
+
+        return Response({
+            'created_count': len(created),
+            'created': [str(row.pk) for row in created],
+            'skipped': [
+                {'student_id': str(pk), 'reason': 'already_has_current_placement'}
+                for pk in student_ids if pk in already_current
+            ],
+        }, status=status.HTTP_201_CREATED)
+
     def get_queryset(self):
         queryset = super().get_queryset()
         params = self.request.query_params
@@ -418,8 +695,10 @@ class AcademicSetupDraftViewSet(RepresentationMixin, viewsets.ModelViewSet):
         serializer = AcademicSetupPublishSerializer(data=draft.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        start_year = data['academic']['start_year']
+        academic_year = f'{start_year}-{start_year + 1}'
         if Academic.objects.filter(
-            academic_year=data['academic']['academic_year']
+            academic_year=academic_year
         ).exists():
             raise ConflictError(
                 'That academic year already exists.',
@@ -427,7 +706,12 @@ class AcademicSetupDraftViewSet(RepresentationMixin, viewsets.ModelViewSet):
             )
 
         with atomic():
-            academic = Academic.objects.create(**data['academic'], is_current=True)
+            academic = Academic.objects.create(
+                academic_year=academic_year,
+                start_date=min(row['start_date'] for row in data['semesters']),
+                end_date=max(row['end_date'] for row in data['semesters']),
+                is_current=True,
+            )
             academic.clear_other_current()
             semesters = {
                 row['semester_no']: Semester.objects.create(academic=academic, **row)
@@ -445,15 +729,45 @@ class AcademicSetupDraftViewSet(RepresentationMixin, viewsets.ModelViewSet):
                     },
                 )
                 majors[code] = major
+            curricula = {}
+            for code, major in majors.items():
+                CurriculumVersion.objects.filter(
+                    major=major, status=CurriculumVersion.Status.ACTIVE
+                ).update(status=CurriculumVersion.Status.RETIRED)
+                curricula[code] = CurriculumVersion.objects.create(
+                    major=major,
+                    name=f'{major.code} Curriculum {start_year}',
+                    effective_from=academic,
+                    status=CurriculumVersion.Status.ACTIVE,
+                )
             created_modules = []
+            definitions = {}
             for row in data['modules']:
+                definition, created = ModuleDefinition.objects.get_or_create(
+                    code=row['module_code'].upper(),
+                    defaults={'name': row['module_name'], 'is_active': True},
+                )
+                if not created and definition.name != row['module_name']:
+                    definition.name = row['module_name']
+                    definition.is_active = True
+                    definition.save(update_fields=['name', 'is_active', 'updated_at'])
+                definitions[definition.code] = definition
+                target_codes = [code.upper() for code in row['major_codes']] or list(majors)
+                for code in target_codes:
+                    CurriculumModule.objects.create(
+                        curriculum=curricula[code],
+                        module_definition=definition,
+                        study_year=row['study_year'],
+                        term_number=row['semester_no'],
+                    )
                 module = Module.objects.create(
                     semester=semesters[row['semester_no']],
+                    definition=definition,
                     study_year=row['study_year'],
-                    module_code=row['module_code'].upper(),
-                    module_name=row['module_name'],
+                    module_code=definition.code,
+                    module_name=definition.name,
                 )
-                module.eligible_majors.set(majors[code.upper()] for code in row['major_codes'])
+                module.eligible_majors.set(majors[code] for code in target_codes)
                 created_modules.append(module)
             draft.status = AcademicSetupDraft.Status.PUBLISHED
             draft.current_step = 4
@@ -465,6 +779,8 @@ class AcademicSetupDraftViewSet(RepresentationMixin, viewsets.ModelViewSet):
                 'academic_id': str(academic.id),
                 'semester_ids': [str(semester.id) for semester in semesters.values()],
                 'module_ids': [str(module.id) for module in created_modules],
+                'curriculum_ids': [str(curriculum.id) for curriculum in curricula.values()],
+                'module_definition_ids': [str(item.id) for item in definitions.values()],
             },
             status=status.HTTP_201_CREATED,
         )

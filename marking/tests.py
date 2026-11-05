@@ -2,7 +2,7 @@ from django.test import TestCase
 
 from catalog.models import Enrollment
 from core.testing import api_client, make_user, mock_push_transport
-from marking.models import AssessmentResult
+from marking.models import AssessmentResult, ModulePeriodResult, ModuleResultSheet, ResultWorkflowEvent
 from teaching.models import Assessment, AssessmentDistribution, LecturePlan
 from teaching.tests import TeachingFixtureMixin
 from users.models import User
@@ -392,6 +392,83 @@ class ResultReadTests(MarkingTestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data['student']['id'], str(self.student.pk))
 
+
+class OfficialPeriodResultFlowTests(MarkingTestCase):
+    def setUp(self):
+        super().setUp()
+        self.student_affairs = make_user(role=User.Role.STUDENT_AFFAIRS)
+        self.affairs_client = api_client(self.student_affairs)
+        self.sheet = ModuleResultSheet.objects.create(lecture_plan=self.plan)
+        self.sheet_url = f'/api/module-result-sheets/{self.sheet.pk}/'
+
+    def marks_payload(self, *rows):
+        return {
+            'results': [
+                {'enrollment_id': str(enrollment.pk), 'raw_mark': mark}
+                for enrollment, mark in rows
+            ]
+        }
+
+    def test_full_submit_verify_lock_flow_and_student_visibility(self):
+        saved = self.teacher_client.post(
+            f'{self.sheet_url}save-marks/',
+            self.marks_payload((self.enrollment, '67.00'), (self.second_enrollment, '81.50')),
+            format='json',
+        )
+        self.assertEqual(saved.status_code, 200, saved.data)
+        self.assertEqual(ModulePeriodResult.objects.count(), 2)
+
+        submitted = self.teacher_client.post(f'{self.sheet_url}submit/', {}, format='json')
+        self.assertEqual(submitted.status_code, 200, submitted.data)
+        self.assertEqual(submitted.data['status'], ModuleResultSheet.Status.SUBMITTED)
+
+        blocked = self.teacher_client.post(
+            f'{self.sheet_url}save-marks/',
+            self.marks_payload((self.enrollment, '70.00')),
+            format='json',
+        )
+        self.assertEqual(blocked.status_code, 400, blocked.data)
+
+        verified = self.affairs_client.post(f'{self.sheet_url}verify/', {}, format='json')
+        self.assertEqual(verified.status_code, 200, verified.data)
+        locked = self.affairs_client.post(f'{self.sheet_url}lock/', {}, format='json')
+        self.assertEqual(locked.status_code, 200, locked.data)
+        self.assertEqual(locked.data['status'], ModuleResultSheet.Status.LOCKED)
+        self.assertEqual(ResultWorkflowEvent.objects.filter(sheet=self.sheet).count(), 3)
+
+        student_rows = api_client(self.student).get('/api/module-period-results/').data
+        self.assertEqual(student_rows['count'], 1)
+        self.assertEqual(student_rows['results'][0]['raw_mark'], '67.00')
+
+    def test_submit_requires_every_active_enrollment_to_have_a_mark(self):
+        self.teacher_client.post(
+            f'{self.sheet_url}save-marks/',
+            self.marks_payload((self.enrollment, '67.00')),
+            format='json',
+        )
+        response = self.teacher_client.post(f'{self.sheet_url}submit/', {}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+        self.sheet.refresh_from_db()
+        self.assertEqual(self.sheet.status, ModuleResultSheet.Status.DRAFT)
+
+    def test_student_affairs_can_return_with_comment_but_lecturer_cannot_verify(self):
+        self.teacher_client.post(
+            f'{self.sheet_url}save-marks/',
+            self.marks_payload((self.enrollment, '67.00'), (self.second_enrollment, '81.50')),
+            format='json',
+        )
+        self.teacher_client.post(f'{self.sheet_url}submit/', {}, format='json')
+
+        forbidden = self.teacher_client.post(f'{self.sheet_url}verify/', {}, format='json')
+        self.assertEqual(forbidden.status_code, 403, forbidden.data)
+        returned = self.affairs_client.post(
+            f'{self.sheet_url}return-for-revision/',
+            {'comment': 'Recheck the second student mark.'},
+            format='json',
+        )
+        self.assertEqual(returned.status_code, 200, returned.data)
+        self.assertEqual(returned.data['status'], ModuleResultSheet.Status.RETURNED)
+        self.assertEqual(returned.data['revision'], 2)
 
 class GradingCompletionTests(MarkingTestCase):
     def test_mark_graded_refuses_a_missing_mark(self):

@@ -9,8 +9,8 @@ flowchart TD
     token["POST /api/token"]
     users["/api/users"]
     me["/api/me"]
-    academics["/api/academics"]
-    semesters["/api/semesters"]
+    periods["/api/teaching-periods"]
+    curricula["/api/curricula"]
     modules["/api/modules"]
     scales["/api/grade-scales"]
     plans["/api/lecture-plans"]
@@ -21,8 +21,9 @@ flowchart TD
     snapshots["/api/module-performances"]
 
     token --> me
-    academics --> semesters --> modules
-    academics --> scales
+    curricula --> modules
+    periods --> modules
+    periods --> scales
     modules --> plans --> distributions --> assessments
     modules --> enrollments
     assessments --> results
@@ -32,6 +33,11 @@ flowchart TD
 ```
 
 Ownership in the tables means the teacher on `lecture_plan.lecturer_id` for that module. Admin includes superuser.
+
+The active setup flow has no separately managed academic-year resource. A curriculum contains
+fixed programme semesters (`1` through `8` or `10`), while a teaching period supplies the label,
+dates, and lifecycle for a real delivery. Legacy `/academics`, `/semesters`, and setup-draft routes
+remain temporarily for data migration and older clients; new clients use `/teaching-periods`.
 
 ## Auth
 
@@ -270,7 +276,40 @@ Create body:
 
 Without `major_id`, each student's current major and original admission date carry forward.
 
-## Academic setup drafts
+## Teaching periods and fixed programme semesters
+
+### `/api/teaching-periods/`
+
+The admin-facing dated delivery resource. Standard list/create/retrieve/update/delete operations
+use this shape:
+
+```json
+{
+  "id": "uuid",
+  "academic_label": "2026-2027",
+  "period_number": 1,
+  "name": "First teaching period",
+  "start_date": "2026-11-01",
+  "end_date": "2027-03-31",
+  "status": "ACTIVE"
+}
+```
+
+`status` is `DRAFT`, `ACTIVE`, `CLOSED`, or `ARCHIVED`. More than one period may be active during
+a transition. `academic_label` is only a reporting label; it is not a separately configured entity.
+
+Curriculum module placement accepts `semester_number` from `1` through the major's duration times
+two. `POST /api/curricula/{id}/generate-offerings/` accepts `teaching_period_id` and
+`programme_semester`, and creates only the modules assigned to that fixed semester.
+
+### `POST /api/student-placements/bulk/`
+
+Creates initial placements for many students with one shared major, programme semester, teaching
+period, and admission date. Send either `student_ids` or `all_unplaced: true`. The latter is resolved
+on the server and is therefore not limited by client pagination. Students with an existing current
+placement are skipped and reported instead of being moved silently.
+
+## Legacy academic setup drafts
 
 `/api/academic-setup-drafts/` is admin-only CRUD for a resumable four-step setup. A draft stores `name`, `current_step` (1–4), and arbitrary `data` JSON without creating live academic records. Published drafts are immutable.
 
@@ -314,7 +353,11 @@ Rules:
 - `academic_year` is unique.
 - `start_date` is before `end_date`.
 - At most one row has `is_current: true`. Setting a new current year clears the previous one in the same transaction.
-- Delete returns `409` when semesters or grade bands exist.
+- Delete is an irreversible, transactional cascade. It removes the year's semesters, student
+  placements, module offerings and major links, teacher plans, assessment distributions,
+  assessments, enrollments, and marks. Shared majors and user accounts are retained.
+- PATCH updates the academic row in place. Related records reference its immutable UUID, so an
+  academic-year label or date edit is immediately visible without rewriting child foreign keys.
 
 Response adds `id`.
 
@@ -747,3 +790,81 @@ Admin, or a teacher limited to their own module. Body is one of:
 ```
 
 `module_id` recomputes every `ENROLLED` and `COMPLETED` enrollment in that module. `200` returns the snapshots. The formula is in [api-analysis.md](api-analysis.md).
+
+## Official period result sheets
+
+This is the university announcement workflow. Each student receives one official **raw module
+mark** per module offering; component distributions remain optional input data for a later phase.
+Every lecture plan has one result sheet.
+
+`DRAFT → SUBMITTED → VERIFIED → LOCKED`
+
+`SUBMITTED` or `VERIFIED` may be `RETURNED` for correction. Only an administrator can unlock a
+published sheet; unlock creates a new revision in `RETURNED`. Every transition records the actor,
+time, status change, and comment.
+
+| Method | Path | Admin | Student Affairs | Assigned lecturer | Student |
+| --- | --- | --- | --- | --- | --- |
+| `GET` | `/api/module-result-sheets/` | all | all | own | no |
+| `POST` | `/api/module-result-sheets/{id}/save-marks/` | yes | no | own draft/returned | no |
+| `POST` | `/api/module-result-sheets/{id}/submit/` | yes | no | own | no |
+| `POST` | `/api/module-result-sheets/{id}/verify/` | yes | yes | no | no |
+| `POST` | `/api/module-result-sheets/{id}/return-for-revision/` | yes | yes | no | no |
+| `POST` | `/api/module-result-sheets/{id}/lock/` | yes | yes | no | no |
+| `POST` | `/api/module-result-sheets/{id}/unlock/` | yes | no | no | no |
+| `GET` | `/api/module-period-results/` | all | all | own modules | own locked rows |
+
+`save-marks` is atomic and accepts enrollment-linked rows:
+
+```json
+{
+  "results": [
+    {"enrollment_id": "<uuid>", "raw_mark": "67.00", "remark": ""},
+    {"enrollment_id": "<uuid>", "raw_mark": "81.50", "remark": ""}
+  ]
+}
+```
+
+Submission requires a raw mark for every `ENROLLED` or `COMPLETED` student. A locked mark is added
+to the student's academic history as `official_raw_mark`; students never see draft review sheets or
+other students' rows.
+
+## Curriculum and yearly offerings
+
+The catalogue now separates permanent academic structure from yearly delivery:
+
+```text
+ModuleDefinition → CurriculumModule → CurriculumVersion
+ModuleDefinition → Module (yearly offering) → Semester → Academic
+Cohort → CohortTerm → Semester
+```
+
+- `ModuleDefinition` is the permanent module code and name.
+- `CurriculumVersion` belongs to one major and can be drafted, activated, then retired.
+- `CurriculumModule` places a definition in Study Year 1–5 and annual Term 1 or Term 2.
+- `Module` remains the compatibility name for a yearly offering. It keeps a historical code/name
+  snapshot and references its permanent definition.
+- `CohortTerm.programme_semester` is derived from study year and annual term, so a four-year
+  programme progresses through programme semesters 1–8 without creating eight terms per session.
+
+| Resource | Path | Purpose |
+| --- | --- | --- |
+| Module catalogue | `/api/module-definitions/` | Permanent module identities |
+| Curriculum versions | `/api/curricula/` | Versioned programme plans |
+| Curriculum placements | `/api/curriculum-modules/` | Module/year/term mapping |
+| Cohorts | `/api/cohorts/` | Intake and curriculum assignment |
+| Cohort progression | `/api/cohort-terms/` | Cohort position in a real academic term |
+| Yearly offerings | `/api/modules/` | Actual modules available for teaching/enrollment |
+
+`POST /api/curricula/{id}/generate-offerings/` accepts `academic_id`. It creates only missing
+offerings for that curriculum and session. Repeating the operation does not duplicate offerings or
+replace existing lecturer assignments, enrollments, assessments, or marks.
+
+Academic setup accepts a starting year instead of duplicated session dates:
+
+```json
+{"academic": {"start_year": 2027}}
+```
+
+The server generates `2027-2028`; its overall start/end dates are derived from the earliest term
+start and latest term end. The term calendars remain independently editable.
